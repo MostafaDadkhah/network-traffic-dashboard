@@ -52,6 +52,7 @@ Rules:
 - Skip the first sample block because it may contain cumulative counters.
 - Parse process identity with `rpartition('.')` because names such as `io.tailscale.ip.79391` contain dots.
 - Tag `MacPacketTunnel`, `Shadowrocket`, and similar tunnel processes as aggregate tunnel rows.
+- Do not rank tunnel aggregates as app usage. Main totals, charts, and tables should use app-attributed non-tunnel rows by default and expose tunnel aggregate volume separately.
 
 ## Verification commands
 

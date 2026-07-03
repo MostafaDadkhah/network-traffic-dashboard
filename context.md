@@ -86,3 +86,9 @@ Reason: It starts automatically at login without requiring root privileges and i
 Decision: Create the GitHub repository as private by default unless Mostafa asks to make it public.
 
 Reason: The project contains no intended sensitive data, but private is the safer default for a local diagnostics tool until publication is explicitly requested.
+
+### 2026-07-03 - App-attributed totals exclude tunnel aggregates
+
+Decision: The main dashboard totals, charts, process table, and CLI reports must exclude `MacPacketTunnel` / `Shadowrocket` tunnel aggregate rows by default. The excluded tunnel transport volume remains visible in separate `tunnel_*` fields and a dedicated dashboard card.
+
+Reason: Ranking `MacPacketTunnel` as the top process answers the wrong question. The user needs the best macOS-exposed app attribution before traffic enters Shadowrocket or another tunnel. Tunnel aggregate rows are transport/overhead evidence, not the real app ranking.

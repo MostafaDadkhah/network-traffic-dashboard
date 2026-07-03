@@ -2,15 +2,16 @@
 
 A macOS-only, zero-runtime-dependency network traffic dashboard for figuring out which process is moving data when VPN clients such as Shadowrocket aggregate traffic under `MacPacketTunnel` in Activity Monitor.
 
-The collector samples Apple's `nettop`, stores every sample in SQLite, and serves a local dashboard with daily, hourly, and per-process charts.
+The collector samples Apple's `nettop`, stores every sample in SQLite, and serves a local dashboard with daily, hourly, and per-process charts. The main dashboard view reports app-attributed traffic before the tunnel and keeps tunnel transport aggregates separate so `MacPacketTunnel` does not hide the real app ranking.
 
 ## Features
 
 - Per-process traffic attribution using `nettop -P -x -d -L 2 -s <interval> -n`.
 - SQLite database storage for every sample and every process delta.
-- Daily totals chart across all recorded days.
-- Hourly chart for the selected day.
-- Top-process chart and sortable-style table for the selected day.
+- Daily app-attributed totals chart across all recorded days.
+- Hourly app-attributed chart for the selected day.
+- Top app-process chart and table for the selected day.
+- Separate tunnel aggregate card for `MacPacketTunnel` / `Shadowrocket` transport volume.
 - CSV export for each day.
 - macOS LaunchAgent installer for automatic background collection.
 - No runtime Python packages beyond the standard library.
@@ -125,4 +126,4 @@ python3 -m pytest -q
 
 ## Notes
 
-`MacPacketTunnel` and `Shadowrocket` rows are aggregate tunnel usage. Other rows such as `Chrome`, `node`, `Python`, `Telegram`, or `Tailscale` identify processes macOS can still attribute before traffic enters the tunnel. Attribution is useful, but not perfect: packet-tunnel aggregate rows can still remain.
+`MacPacketTunnel` and `Shadowrocket` rows are aggregate tunnel transport usage, not the real app ranking. The dashboard excludes those tunnel rows from main totals, charts, tables, and CLI reports by default, then shows the excluded tunnel volume separately. Other rows such as `Chrome`, `node`, `Python`, `Telegram`, or `Tailscale` identify processes macOS can still attribute before traffic enters the tunnel. Attribution is useful, but not perfect: traffic that macOS only exposes as packet-tunnel transport cannot be reassigned to an original app without deeper privileged packet/flow instrumentation.

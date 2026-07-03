@@ -353,9 +353,29 @@ def empty_summary(data_dir: Path, date: str) -> dict[str, Any]:
         "bytes_in": 0,
         "bytes_out": 0,
         "total_bytes": 0,
+        "observed_bytes_in": 0,
+        "observed_bytes_out": 0,
+        "observed_total_bytes": 0,
+        "tunnel_bytes_in": 0,
+        "tunnel_bytes_out": 0,
+        "tunnel_total_bytes": 0,
         "processes": [],
+        "tunnel_processes": [],
         "latest_processes": [],
+        "latest_tunnel_processes": [],
     }
+
+
+def normalize_process_rows(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+    normalized = [dict(row) for row in rows]
+    for row in normalized:
+        row["bytes_in"] = int(row.get("bytes_in") or 0)
+        row["bytes_out"] = int(row.get("bytes_out") or 0)
+        row["total_bytes"] = int(row.get("total_bytes") or 0)
+        row["samples"] = int(row.get("samples") or 0)
+        row["pids"] = parse_pids(row.get("pids"))
+        row["is_tunnel"] = bool(row.get("is_tunnel"))
+    return normalized
 
 
 def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | None = None) -> dict[str, Any]:
@@ -366,12 +386,26 @@ def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | N
             """
             SELECT COUNT(*) AS sample_count,
                    MIN(ts) AS first_sample_at,
-                   MAX(ts) AS last_sample_at,
-                   COALESCE(SUM(bytes_in), 0) AS bytes_in,
-                   COALESCE(SUM(bytes_out), 0) AS bytes_out,
-                   COALESCE(SUM(total_bytes), 0) AS total_bytes
+                   MAX(ts) AS last_sample_at
             FROM samples
             WHERE date = ?
+            """,
+            (selected_date,),
+        ).fetchone()
+        traffic_stats = conn.execute(
+            """
+            SELECT COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_in ELSE 0 END), 0) AS bytes_in,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_out ELSE 0 END), 0) AS bytes_out,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.total_bytes ELSE 0 END), 0) AS total_bytes,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_in ELSE 0 END), 0) AS tunnel_bytes_in,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_out ELSE 0 END), 0) AS tunnel_bytes_out,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.total_bytes ELSE 0 END), 0) AS tunnel_total_bytes,
+                   COALESCE(SUM(d.bytes_in), 0) AS observed_bytes_in,
+                   COALESCE(SUM(d.bytes_out), 0) AS observed_bytes_out,
+                   COALESCE(SUM(d.total_bytes), 0) AS observed_total_bytes
+            FROM process_deltas d
+            JOIN samples s ON s.id = d.sample_id
+            WHERE s.date = ?
             """,
             (selected_date,),
         ).fetchone()
@@ -390,7 +424,7 @@ def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | N
             summary["last_error"] = error_stats["last_error"] if error_stats else None
             return summary
 
-        process_query = """
+        process_select = """
             SELECT d.process AS process,
                    COALESCE(SUM(d.bytes_in), 0) AS bytes_in,
                    COALESCE(SUM(d.bytes_out), 0) AS bytes_out,
@@ -400,40 +434,49 @@ def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | N
                    GROUP_CONCAT(DISTINCT d.pid) AS pids
             FROM process_deltas d
             JOIN samples s ON s.id = d.sample_id
-            WHERE s.date = ?
+            WHERE s.date = ? AND d.is_tunnel = ?
             GROUP BY d.process
             ORDER BY total_bytes DESC
         """
-        params: list[Any] = [selected_date]
+        process_query = process_select
+        params: list[Any] = [selected_date, 0]
         if top_limit is not None:
             process_query += " LIMIT ?"
             params.append(top_limit)
-        process_rows = [dict(row) for row in conn.execute(process_query, params)]
-        for row in process_rows:
-            row["pids"] = parse_pids(row.get("pids"))
-            row["is_tunnel"] = bool(row.get("is_tunnel"))
+        process_rows = normalize_process_rows(conn.execute(process_query, params))
+        tunnel_rows = normalize_process_rows(conn.execute(process_select, (selected_date, 1)))
 
         latest_sample = conn.execute(
             "SELECT id FROM samples WHERE date = ? ORDER BY ts DESC, id DESC LIMIT 1",
             (selected_date,),
         ).fetchone()
         latest_rows: list[dict[str, Any]] = []
+        latest_tunnel_rows: list[dict[str, Any]] = []
         if latest_sample:
-            latest_rows = [
-                dict(row)
-                for row in conn.execute(
+            latest_rows = normalize_process_rows(
+                conn.execute(
                     """
                     SELECT raw_process, process, pid, bytes_in, bytes_out, total_bytes, is_tunnel
                     FROM process_deltas
-                    WHERE sample_id = ?
+                    WHERE sample_id = ? AND is_tunnel = 0
                     ORDER BY total_bytes DESC
                     LIMIT 20
                     """,
                     (latest_sample["id"],),
                 )
-            ]
-            for row in latest_rows:
-                row["is_tunnel"] = bool(row.get("is_tunnel"))
+            )
+            latest_tunnel_rows = normalize_process_rows(
+                conn.execute(
+                    """
+                    SELECT raw_process, process, pid, bytes_in, bytes_out, total_bytes, is_tunnel
+                    FROM process_deltas
+                    WHERE sample_id = ? AND is_tunnel = 1
+                    ORDER BY total_bytes DESC
+                    LIMIT 20
+                    """,
+                    (latest_sample["id"],),
+                )
+            )
 
     return {
         "date": selected_date,
@@ -444,11 +487,19 @@ def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | N
         "first_sample_at": sample_stats["first_sample_at"],
         "last_sample_at": sample_stats["last_sample_at"],
         "last_error": error_stats["last_error"] if error_stats else None,
-        "bytes_in": int(sample_stats["bytes_in"] or 0),
-        "bytes_out": int(sample_stats["bytes_out"] or 0),
-        "total_bytes": int(sample_stats["total_bytes"] or 0),
+        "bytes_in": int(traffic_stats["bytes_in"] or 0),
+        "bytes_out": int(traffic_stats["bytes_out"] or 0),
+        "total_bytes": int(traffic_stats["total_bytes"] or 0),
+        "observed_bytes_in": int(traffic_stats["observed_bytes_in"] or 0),
+        "observed_bytes_out": int(traffic_stats["observed_bytes_out"] or 0),
+        "observed_total_bytes": int(traffic_stats["observed_total_bytes"] or 0),
+        "tunnel_bytes_in": int(traffic_stats["tunnel_bytes_in"] or 0),
+        "tunnel_bytes_out": int(traffic_stats["tunnel_bytes_out"] or 0),
+        "tunnel_total_bytes": int(traffic_stats["tunnel_total_bytes"] or 0),
         "processes": process_rows,
+        "tunnel_processes": tunnel_rows,
         "latest_processes": latest_rows,
+        "latest_tunnel_processes": latest_tunnel_rows,
     }
 
 
@@ -458,14 +509,19 @@ def list_days(data_dir: Path) -> list[dict[str, Any]]:
         day_map: dict[str, dict[str, Any]] = {}
         for row in conn.execute(
             """
-            SELECT date,
-                   COUNT(*) AS sample_count,
-                   COALESCE(SUM(bytes_in), 0) AS bytes_in,
-                   COALESCE(SUM(bytes_out), 0) AS bytes_out,
-                   COALESCE(SUM(total_bytes), 0) AS total_bytes,
-                   MAX(ts) AS last_sample_at
-            FROM samples
-            GROUP BY date
+            SELECT s.date AS date,
+                   COUNT(DISTINCT s.id) AS sample_count,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_in ELSE 0 END), 0) AS bytes_in,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_out ELSE 0 END), 0) AS bytes_out,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.total_bytes ELSE 0 END), 0) AS total_bytes,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_in ELSE 0 END), 0) AS tunnel_bytes_in,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_out ELSE 0 END), 0) AS tunnel_bytes_out,
+                   COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.total_bytes ELSE 0 END), 0) AS tunnel_total_bytes,
+                   COALESCE(SUM(d.total_bytes), 0) AS observed_total_bytes,
+                   MAX(s.ts) AS last_sample_at
+            FROM samples s
+            LEFT JOIN process_deltas d ON d.sample_id = s.id
+            GROUP BY s.date
             """
         ):
             day_map[row["date"]] = {
@@ -476,6 +532,10 @@ def list_days(data_dir: Path) -> list[dict[str, Any]]:
                 "total_bytes": int(row["total_bytes"] or 0),
                 "bytes_in": int(row["bytes_in"] or 0),
                 "bytes_out": int(row["bytes_out"] or 0),
+                "tunnel_bytes_in": int(row["tunnel_bytes_in"] or 0),
+                "tunnel_bytes_out": int(row["tunnel_bytes_out"] or 0),
+                "tunnel_total_bytes": int(row["tunnel_total_bytes"] or 0),
+                "observed_total_bytes": int(row["observed_total_bytes"] or 0),
                 "last_sample_at": row["last_sample_at"],
             }
         for row in conn.execute("SELECT date, COUNT(*) AS error_count FROM errors GROUP BY date"):
@@ -489,6 +549,10 @@ def list_days(data_dir: Path) -> list[dict[str, Any]]:
                     "total_bytes": 0,
                     "bytes_in": 0,
                     "bytes_out": 0,
+                    "tunnel_bytes_in": 0,
+                    "tunnel_bytes_out": 0,
+                    "tunnel_total_bytes": 0,
+                    "observed_total_bytes": 0,
                     "last_sample_at": None,
                 },
             )
@@ -504,13 +568,16 @@ def timeseries_day(data_dir: Path, date: str | None = None) -> list[dict[str, An
             dict(row)
             for row in conn.execute(
                 """
-                SELECT substr(ts, 12, 2) AS hour,
-                       COALESCE(SUM(bytes_in), 0) AS bytes_in,
-                       COALESCE(SUM(bytes_out), 0) AS bytes_out,
-                       COALESCE(SUM(total_bytes), 0) AS total_bytes,
-                       COUNT(*) AS sample_count
-                FROM samples
-                WHERE date = ?
+                SELECT substr(s.ts, 12, 2) AS hour,
+                       COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_in ELSE 0 END), 0) AS bytes_in,
+                       COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_out ELSE 0 END), 0) AS bytes_out,
+                       COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.total_bytes ELSE 0 END), 0) AS total_bytes,
+                       COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.total_bytes ELSE 0 END), 0) AS tunnel_total_bytes,
+                       COALESCE(SUM(d.total_bytes), 0) AS observed_total_bytes,
+                       COUNT(DISTINCT s.id) AS sample_count
+                FROM samples s
+                LEFT JOIN process_deltas d ON d.sample_id = s.id
+                WHERE s.date = ?
                 GROUP BY hour
                 ORDER BY hour ASC
                 """,
@@ -522,6 +589,8 @@ def timeseries_day(data_dir: Path, date: str | None = None) -> list[dict[str, An
         row["bytes_in"] = int(row["bytes_in"] or 0)
         row["bytes_out"] = int(row["bytes_out"] or 0)
         row["total_bytes"] = int(row["total_bytes"] or 0)
+        row["tunnel_total_bytes"] = int(row["tunnel_total_bytes"] or 0)
+        row["observed_total_bytes"] = int(row["observed_total_bytes"] or 0)
         row["sample_count"] = int(row["sample_count"] or 0)
     return rows
 
@@ -541,23 +610,27 @@ def print_report(summary: dict[str, Any], *, top: int) -> None:
     print(f"Date: {summary['date']}")
     print(f"Database: {summary['database_path']}")
     print(
-        "Total: "
+        "App-attributed total: "
         f"{human_bytes(summary['total_bytes'])} "
         f"(in {human_bytes(summary['bytes_in'])}, out {human_bytes(summary['bytes_out'])})"
     )
+    print(
+        "Tunnel aggregate excluded from app ranking: "
+        f"{human_bytes(summary.get('tunnel_total_bytes', 0))}"
+    )
+    print(f"Observed raw total including tunnel aggregate: {human_bytes(summary.get('observed_total_bytes', 0))}")
     print(f"Samples: {summary['sample_count']}  Errors: {summary['error_count']}")
     print("")
-    print(f"{'process':32s} {'total':>12s} {'in':>12s} {'out':>12s}  pids")
+    print(f"{'app process':32s} {'total':>12s} {'in':>12s} {'out':>12s}  pids")
     print("-" * 82)
     for row in summary["processes"][:top]:
         pids = ",".join(str(pid) for pid in row.get("pids", [])[:6])
-        suffix = "  [tunnel]" if row.get("is_tunnel") else ""
         print(
             f"{row['process'][:32]:32s} "
             f"{human_bytes(row['total_bytes']):>12s} "
             f"{human_bytes(row['bytes_in']):>12s} "
             f"{human_bytes(row['bytes_out']):>12s}  "
-            f"{pids}{suffix}"
+            f"{pids}"
         )
 
 
@@ -599,7 +672,7 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
   <header>
     <h1>Network Traffic Dashboard</h1>
-    <div class="muted">Per-process macOS traffic from nettop. MacPacketTunnel and Shadowrocket rows are aggregate tunnel usage.</div>
+    <div class="muted">Pre-tunnel app-attributed traffic from nettop. MacPacketTunnel and Shadowrocket are transport aggregates and are excluded from app rankings.</div>
   </header>
   <main>
     <div class="toolbar">
@@ -609,18 +682,19 @@ DASHBOARD_HTML = """<!doctype html>
       <span id="status" class="muted"></span>
     </div>
     <section class="cards">
-      <div class="card"><div class="label">Selected-day total</div><div id="total" class="value">-</div></div>
-      <div class="card"><div class="label">Download</div><div id="bytesIn" class="value">-</div></div>
-      <div class="card"><div class="label">Upload</div><div id="bytesOut" class="value">-</div></div>
+      <div class="card"><div class="label">App-attributed total</div><div id="total" class="value">-</div></div>
+      <div class="card"><div class="label">App download</div><div id="bytesIn" class="value">-</div></div>
+      <div class="card"><div class="label">App upload</div><div id="bytesOut" class="value">-</div></div>
+      <div class="card"><div class="label">Tunnel aggregate excluded</div><div id="tunnelTotal" class="value">-</div></div>
       <div class="card"><div class="label">Samples</div><div id="samples" class="value">-</div></div>
     </section>
     <section class="charts">
-      <div class="chart-card"><h2 class="chart-title">Daily totals</h2><canvas id="dailyChart"></canvas></div>
-      <div class="chart-card"><h2 class="chart-title">Hourly traffic for selected day</h2><canvas id="hourlyChart"></canvas></div>
-      <div class="chart-card"><h2 class="chart-title">Top processes for selected day</h2><canvas id="processChart"></canvas></div>
+      <div class="chart-card"><h2 class="chart-title">Daily app-attributed totals</h2><canvas id="dailyChart"></canvas></div>
+      <div class="chart-card"><h2 class="chart-title">Hourly app-attributed traffic</h2><canvas id="hourlyChart"></canvas></div>
+      <div class="chart-card"><h2 class="chart-title">Top app processes before tunnel</h2><canvas id="processChart"></canvas></div>
     </section>
     <table>
-      <thead><tr><th>Process</th><th>Total</th><th>Download</th><th>Upload</th><th>Share</th><th>PIDs</th></tr></thead>
+      <thead><tr><th>App process</th><th>Total</th><th>Download</th><th>Upload</th><th>Share</th><th>PIDs</th></tr></thead>
       <tbody id="rows"><tr><td colspan="6">Loading...</td></tr></tbody>
     </table>
     <footer id="footer"></footer>
@@ -716,7 +790,7 @@ async function loadDays() {
   for (const day of days.days) {
     const opt = document.createElement('option');
     opt.value = day.date;
-    opt.textContent = `${day.date} - ${fmtBytes(day.total_bytes)}`;
+    opt.textContent = `${day.date} - apps ${fmtBytes(day.total_bytes)}`;
     select.appendChild(opt);
   }
   if (previous) select.value = previous;
@@ -731,6 +805,7 @@ async function loadSummary() {
   document.getElementById('total').textContent = fmtBytes(data.total_bytes);
   document.getElementById('bytesIn').textContent = fmtBytes(data.bytes_in);
   document.getElementById('bytesOut').textContent = fmtBytes(data.bytes_out);
+  document.getElementById('tunnelTotal').textContent = fmtBytes(data.tunnel_total_bytes);
   document.getElementById('samples').textContent = data.sample_count;
   document.getElementById('csvLink').href = `/api/export.csv?date=${encodeURIComponent(data.date)}`;
   document.getElementById('status').textContent = data.last_sample_at ? `Last sample: ${data.last_sample_at}` : 'No sample yet';
@@ -742,14 +817,13 @@ async function loadSummary() {
   const max = Math.max(...rows.map(p => p.total_bytes), 1);
   for (const row of rows) {
     const tr = document.createElement('tr');
-    const tunnel = row.is_tunnel ? '<span class="pill">tunnel aggregate</span>' : '';
     const share = Math.round((row.total_bytes / max) * 100);
-    tr.innerHTML = `<td>${escapeHtml(row.process)} ${tunnel}</td><td>${fmtBytes(row.total_bytes)}</td><td>${fmtBytes(row.bytes_in)}</td><td>${fmtBytes(row.bytes_out)}</td><td><div class="bar"><span style="width:${share}%"></span></div></td><td>${escapeHtml((row.pids || []).join(', '))}</td>`;
+    tr.innerHTML = `<td>${escapeHtml(row.process)}</td><td>${fmtBytes(row.total_bytes)}</td><td>${fmtBytes(row.bytes_in)}</td><td>${fmtBytes(row.bytes_out)}</td><td><div class="bar"><span style="width:${share}%"></span></div></td><td>${escapeHtml((row.pids || []).join(', '))}</td>`;
     tbody.appendChild(tr);
   }
   if (!rows.length) tbody.innerHTML = '<tr><td colspan="6">No data has been recorded yet.</td></tr>';
   const err = data.last_error ? ` <span class="error">Last error: ${escapeHtml(data.last_error)}</span>` : '';
-  document.getElementById('footer').innerHTML = `Database: ${escapeHtml(data.database_path)}${err}`;
+  document.getElementById('footer').innerHTML = `Database: ${escapeHtml(data.database_path)}. App totals exclude tunnel transport aggregate (${fmtBytes(data.tunnel_total_bytes)}). Observed raw total including tunnel: ${fmtBytes(data.observed_total_bytes)}.${err}`;
 }
 async function refreshAll() { await loadDays(); await loadSummary(); }
 document.getElementById('refreshBtn').addEventListener('click', refreshAll);
@@ -954,7 +1028,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.days:
         for day in list_days(args.data_dir):
             print(
-                f"{day['date']}  total={human_bytes(day['total_bytes'])}  "
+                f"{day['date']}  app_total={human_bytes(day['total_bytes'])}  "
+                f"tunnel_excluded={human_bytes(day.get('tunnel_total_bytes', 0))}  "
                 f"samples={day['sample_count']}  errors={day['error_count']}  {day['database_path']}"
             )
         return 0

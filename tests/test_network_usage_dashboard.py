@@ -46,14 +46,21 @@ def test_append_and_summarize_daily_database(tmp_path) -> None:
     assert db_path.exists()
     assert summary["sample_count"] == 1
     assert summary["error_count"] == 0
-    assert summary["total_bytes"] == sum(row.total_bytes for row in rows)
-    assert summary["processes"][0]["process"] == "MacPacketTunnel"
-    assert summary["processes"][0]["is_tunnel"] is True
-    assert summary["latest_processes"][0]["process"] == "MacPacketTunnel"
+    app_total = rows[0].total_bytes + rows[2].total_bytes
+    tunnel_total = rows[1].total_bytes
+    assert summary["total_bytes"] == app_total
+    assert summary["tunnel_total_bytes"] == tunnel_total
+    assert summary["observed_total_bytes"] == app_total + tunnel_total
+    assert summary["processes"][0]["process"] == "io.tailscale.ip"
+    assert all(not row["is_tunnel"] for row in summary["processes"])
+    assert summary["tunnel_processes"][0]["process"] == "MacPacketTunnel"
+    assert summary["latest_processes"][0]["process"] == "io.tailscale.ip"
+    assert summary["latest_tunnel_processes"][0]["process"] == "MacPacketTunnel"
 
     days = dashboard.list_days(tmp_path)
     assert days[0]["date"] == "2026-07-03"
     assert days[0]["total_bytes"] == summary["total_bytes"]
+    assert days[0]["tunnel_total_bytes"] == summary["tunnel_total_bytes"]
 
 
 def test_timeseries_groups_samples_by_hour(tmp_path) -> None:
@@ -79,6 +86,8 @@ def test_timeseries_groups_samples_by_hour(tmp_path) -> None:
             "bytes_in": 200,
             "bytes_out": 100,
             "total_bytes": 300,
+            "tunnel_total_bytes": 0,
+            "observed_total_bytes": 300,
             "sample_count": 2,
             "label": "12:00",
         }
@@ -103,4 +112,5 @@ def test_export_csv_contains_process_totals(tmp_path) -> None:
 def test_dashboard_html_is_english() -> None:
     assert '<html lang="en"' in dashboard.DASHBOARD_HTML
     assert "Network Traffic Dashboard" in dashboard.DASHBOARD_HTML
+    assert "Pre-tunnel app-attributed traffic" in dashboard.DASHBOARD_HTML
     assert "No data has been recorded yet." in dashboard.DASHBOARD_HTML
