@@ -113,4 +113,9 @@ def test_dashboard_html_is_english() -> None:
     assert '<html lang="en"' in dashboard.DASHBOARD_HTML
     assert "Network Traffic Dashboard" in dashboard.DASHBOARD_HTML
     assert "Pre-tunnel app-attributed traffic" in dashboard.DASHBOARD_HTML
+    assert 'id="datePicker" type="date"' in dashboard.DASHBOARD_HTML
+    assert "Previous day" in dashboard.DASHBOARD_HTML
+    assert "Next day" in dashboard.DASHBOARD_HTML
+    assert "Latest day" in dashboard.DASHBOARD_HTML
+    assert "daySelect" not in dashboard.DASHBOARD_HTML
     assert "No data has been recorded yet." in dashboard.DASHBOARD_HTML

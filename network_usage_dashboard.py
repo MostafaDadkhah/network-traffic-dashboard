@@ -652,8 +652,10 @@ DASHBOARD_HTML = """<!doctype html>
     .card .label { color: #9fb0d0; font-size: 13px; }
     .card .value { font-size: 25px; margin-top: 8px; font-weight: 700; }
     .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 14px 0 18px; }
-    select, button, a.button { background: #18233d; color: #e7edf7; border: 1px solid #34425f; border-radius: 10px; padding: 9px 12px; text-decoration: none; }
+    input[type="date"], button, a.button { background: #18233d; color: #e7edf7; border: 1px solid #34425f; border-radius: 10px; padding: 9px 12px; text-decoration: none; }
+    input[type="date"] { color-scheme: dark; min-width: 150px; }
     button:hover, a.button:hover { background: #22304f; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
     .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; margin: 18px 0; }
     .chart-card { background: #11182c; border: 1px solid #25304a; border-radius: 14px; padding: 16px; }
     .chart-title { margin: 0 0 10px; color: #c7d2fe; font-size: 14px; }
@@ -676,7 +678,10 @@ DASHBOARD_HTML = """<!doctype html>
   </header>
   <main>
     <div class="toolbar">
-      <label>Day: <select id="daySelect"></select></label>
+      <label>Date: <input id="datePicker" type="date" aria-label="Selected dashboard date"></label>
+      <button id="previousDayBtn" title="Go to previous recorded day">Previous day</button>
+      <button id="nextDayBtn" title="Go to next recorded day">Next day</button>
+      <button id="latestDayBtn" title="Go to latest recorded day">Latest day</button>
       <button id="refreshBtn">Refresh</button>
       <a id="csvLink" class="button" href="#">CSV export</a>
       <span id="status" class="muted"></span>
@@ -777,38 +782,79 @@ function drawBars(canvas, items, options = {}) {
   ctx.fillStyle = '#e7edf7';
   ctx.fillText(fmtBytes(max), padLeft + 6, padTop + 12);
 }
-async function loadDays() {
-  const days = await fetch('/api/days').then(r => r.json());
-  const select = document.getElementById('daySelect');
-  const previous = select.value;
-  select.innerHTML = '';
-  if (!days.days.length) {
-    const opt = document.createElement('option'); opt.value = ''; opt.textContent = 'today'; select.appendChild(opt);
-    drawBars(document.getElementById('dailyChart'), []);
+let recordedDays = [];
+let recordedDateValues = [];
+const datePicker = document.getElementById('datePicker');
+const previousDayBtn = document.getElementById('previousDayBtn');
+const nextDayBtn = document.getElementById('nextDayBtn');
+const latestDayBtn = document.getElementById('latestDayBtn');
+function latestRecordedDate() {
+  return recordedDateValues.length ? recordedDateValues[recordedDateValues.length - 1] : '';
+}
+function updateDateNavButtons() {
+  const current = datePicker.value || latestRecordedDate();
+  const hasPrevious = recordedDateValues.some(day => day < current);
+  const hasNext = recordedDateValues.some(day => day > current);
+  previousDayBtn.disabled = !hasPrevious;
+  nextDayBtn.disabled = !hasNext;
+  latestDayBtn.disabled = !latestRecordedDate() || current === latestRecordedDate();
+}
+function updateDatePickerBounds() {
+  if (!recordedDateValues.length) {
+    datePicker.removeAttribute('min');
+    datePicker.removeAttribute('max');
+    updateDateNavButtons();
     return;
   }
-  for (const day of days.days) {
-    const opt = document.createElement('option');
-    opt.value = day.date;
-    opt.textContent = `${day.date} - apps ${fmtBytes(day.total_bytes)}`;
-    select.appendChild(opt);
+  datePicker.min = recordedDateValues[0];
+  datePicker.max = recordedDateValues[recordedDateValues.length - 1];
+  updateDateNavButtons();
+}
+function moveRecordedDay(delta) {
+  if (!recordedDateValues.length) return;
+  const current = datePicker.value || latestRecordedDate();
+  const exactIndex = recordedDateValues.indexOf(current);
+  let target = '';
+  if (exactIndex >= 0) {
+    target = recordedDateValues[exactIndex + delta] || '';
+  } else if (delta < 0) {
+    target = [...recordedDateValues].reverse().find(day => day < current) || '';
+  } else {
+    target = recordedDateValues.find(day => day > current) || '';
   }
-  if (previous) select.value = previous;
-  drawBars(document.getElementById('dailyChart'), [...days.days].reverse(), { labelKey: 'date', color: '#22c55e' });
+  if (!target) return;
+  datePicker.value = target;
+  loadSummary().catch(err => { document.getElementById('status').textContent = err; });
+}
+async function loadDays() {
+  const days = await fetch('/api/days').then(r => r.json());
+  const previous = datePicker.value;
+  recordedDays = days.days || [];
+  recordedDateValues = recordedDays.map(day => day.date).sort();
+  if (!recordedDateValues.length) {
+    datePicker.value = '';
+    drawBars(document.getElementById('dailyChart'), []);
+    updateDatePickerBounds();
+    return;
+  }
+  datePicker.value = previous || latestRecordedDate();
+  updateDatePickerBounds();
+  drawBars(document.getElementById('dailyChart'), [...recordedDays].reverse(), { labelKey: 'date', color: '#22c55e' });
 }
 async function loadSummary() {
-  const select = document.getElementById('daySelect');
-  const date = select.value;
+  const date = datePicker.value;
   const url = date ? `/api/day?date=${encodeURIComponent(date)}` : '/api/today';
   const data = await fetch(url).then(r => r.json());
   const series = await fetch(`/api/timeseries?date=${encodeURIComponent(data.date)}`).then(r => r.json());
+  if (!datePicker.value && data.date) datePicker.value = data.date;
+  updateDateNavButtons();
   document.getElementById('total').textContent = fmtBytes(data.total_bytes);
   document.getElementById('bytesIn').textContent = fmtBytes(data.bytes_in);
   document.getElementById('bytesOut').textContent = fmtBytes(data.bytes_out);
   document.getElementById('tunnelTotal').textContent = fmtBytes(data.tunnel_total_bytes);
   document.getElementById('samples').textContent = data.sample_count;
   document.getElementById('csvLink').href = `/api/export.csv?date=${encodeURIComponent(data.date)}`;
-  document.getElementById('status').textContent = data.last_sample_at ? `Last sample: ${data.last_sample_at}` : 'No sample yet';
+  document.getElementById('status').textContent = data.last_sample_at ? `Last sample: ${data.last_sample_at}` : `No samples for ${data.date}`;
   drawBars(document.getElementById('hourlyChart'), series.series, { labelKey: 'label', color: '#38bdf8' });
   drawBars(document.getElementById('processChart'), data.processes.slice(0, 10), { labelKey: 'process', color: '#a78bfa', horizontal: true });
   const tbody = document.getElementById('rows');
@@ -827,10 +873,19 @@ async function loadSummary() {
 }
 async function refreshAll() { await loadDays(); await loadSummary(); }
 document.getElementById('refreshBtn').addEventListener('click', refreshAll);
-document.getElementById('daySelect').addEventListener('change', loadSummary);
+datePicker.addEventListener('change', loadSummary);
+previousDayBtn.addEventListener('click', () => moveRecordedDay(-1));
+nextDayBtn.addEventListener('click', () => moveRecordedDay(1));
+latestDayBtn.addEventListener('click', () => {
+  const latest = latestRecordedDate();
+  if (!latest) return;
+  datePicker.value = latest;
+  loadSummary().catch(err => { document.getElementById('status').textContent = err; });
+});
 window.addEventListener('resize', () => { loadSummary().catch(() => {}); });
 refreshAll().catch(err => { document.getElementById('status').textContent = err; });
 setInterval(() => { loadSummary().catch(() => {}); }, 5000);
+setInterval(() => { loadDays().catch(() => {}); }, 60000);
 </script>
 </body>
 </html>

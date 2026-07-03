@@ -92,3 +92,9 @@ Reason: The project contains no intended sensitive data, but private is the safe
 Decision: The main dashboard totals, charts, process table, and CLI reports must exclude `MacPacketTunnel` / `Shadowrocket` tunnel aggregate rows by default. The excluded tunnel transport volume remains visible in separate `tunnel_*` fields and a dedicated dashboard card.
 
 Reason: Ranking `MacPacketTunnel` as the top process answers the wrong question. The user needs the best macOS-exposed app attribution before traffic enters Shadowrocket or another tunnel. Tunnel aggregate rows are transport/overhead evidence, not the real app ranking.
+
+### 2026-07-03 - Calendar-style date navigation
+
+Decision: Use a browser-native `input type="date"` control plus previous/next/latest recorded-day buttons instead of a plain select dropdown.
+
+Reason: Daily review is the core dashboard workflow, and a calendar-style picker makes it faster to jump between dates while preserving the zero-dependency dashboard implementation.
