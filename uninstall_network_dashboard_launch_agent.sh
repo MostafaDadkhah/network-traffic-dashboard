@@ -9,4 +9,4 @@ launchctl bootout "gui/$UID_NUM" "$PLIST" >/dev/null 2>&1 || true
 rm -f "$PLIST"
 
 echo "Uninstalled $LABEL"
-echo "Daily logs were kept under: $HOME/Library/Application Support/NetworkTrafficDashboard/logs"
+echo "Collected database was kept under: $HOME/Library/Application Support/NetworkTrafficDashboard/network_traffic.sqlite3"

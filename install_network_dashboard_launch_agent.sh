@@ -30,7 +30,7 @@ if sys.version_info < (3, 10):
     raise SystemExit("Python 3.10+ is required for network_usage_dashboard.py")
 PY
 
-mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR" "$DATA_DIR/logs"
+mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR" "$DATA_DIR"
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -76,6 +76,6 @@ launchctl kickstart -k "gui/$UID_NUM/$LABEL"
 
 echo "Installed and started $LABEL"
 echo "Dashboard: http://$BIND/"
-echo "Daily logs: $DATA_DIR/logs"
+echo "Database: $DATA_DIR/network_traffic.sqlite3"
 echo "Service logs: $LOG_DIR"
 echo "Plist: $PLIST"
