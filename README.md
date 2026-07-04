@@ -6,8 +6,6 @@ The collector samples Apple's `nettop`, stores every sample in SQLite, and serve
 
 ## Screenshot
 
-macOS-only local dashboard screenshot, captured from the dashboard page itself without browser chrome, desktop chrome, or OS UI.
-
 ![macOS Network Traffic Dashboard screenshot](docs/dashboard.png)
 
 ## Features
