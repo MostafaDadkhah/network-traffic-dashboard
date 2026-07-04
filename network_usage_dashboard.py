@@ -742,6 +742,10 @@ const fmtBytes = (value) => {
     n /= 1024;
   }
 };
+const formatDateLabel = (value) => {
+  const parts = String(value || '').split('-');
+  return parts.length === 3 ? `${parts[1]}/${parts[2]}` : String(value || '').slice(0, 8);
+};
 const escapeHtml = (s) => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 function prepareCanvas(canvas) {
   const ratio = window.devicePixelRatio || 1;
@@ -764,12 +768,15 @@ function drawBars(canvas, items, options = {}) {
   const labelKey = options.labelKey || 'label';
   const valueKey = options.valueKey || 'total_bytes';
   const color = options.color || '#38bdf8';
+  const labelFormatter = options.labelFormatter || ((item) => String(item[labelKey]));
   const max = Math.max(...items.map(item => Number(item[valueKey] || 0)), 1);
   const padLeft = options.horizontal ? 112 : 34;
-  const padBottom = 34;
+  const padBottom = options.horizontal ? 34 : (options.padBottom || 58);
   const padTop = 18;
   const chartW = width - padLeft - 12;
   const chartH = height - padTop - padBottom;
+  const labelMinWidth = options.labelMinWidth || 48;
+  const labelEvery = options.labelEvery || Math.max(1, Math.ceil(items.length / Math.max(1, Math.floor(chartW / labelMinWidth))));
   ctx.strokeStyle = '#26324f';
   ctx.beginPath();
   ctx.moveTo(padLeft, padTop);
@@ -784,7 +791,9 @@ function drawBars(canvas, items, options = {}) {
       const value = Number(item[valueKey] || 0);
       const barW = Math.max(1, (value / max) * chartW);
       ctx.fillStyle = '#9fb0d0';
-      ctx.fillText(String(item[labelKey]).slice(0, 16), 8, y + barH * 0.75);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(String(labelFormatter(item, idx)).slice(0, 16), 8, y + barH * 0.75);
       ctx.fillStyle = color;
       ctx.fillRect(padLeft, y, barW, barH);
       ctx.fillStyle = '#e7edf7';
@@ -792,8 +801,8 @@ function drawBars(canvas, items, options = {}) {
     });
     return;
   }
-  const gap = 8;
-  const barW = Math.max(8, (chartW - gap * (items.length - 1)) / items.length);
+  const gap = Math.max(2, Math.min(8, chartW / Math.max(items.length * 8, 1)));
+  const barW = Math.max(2, (chartW - gap * (items.length - 1)) / items.length);
   items.forEach((item, idx) => {
     const value = Number(item[valueKey] || 0);
     const barH = (value / max) * chartH;
@@ -801,14 +810,16 @@ function drawBars(canvas, items, options = {}) {
     const y = padTop + chartH - barH;
     ctx.fillStyle = color;
     ctx.fillRect(x, y, barW, barH);
-    ctx.save();
-    ctx.translate(x + Math.min(18, barW), padTop + chartH + 18);
-    ctx.rotate(-Math.PI / 5);
-    ctx.fillStyle = '#9fb0d0';
-    ctx.fillText(String(item[labelKey]).slice(0, 11), 0, 0);
-    ctx.restore();
+    if (idx % labelEvery === 0 || idx === items.length - 1) {
+      ctx.fillStyle = '#9fb0d0';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(String(labelFormatter(item, idx)).slice(0, options.maxLabelChars || 8), x + barW / 2, padTop + chartH + 10);
+    }
   });
   ctx.fillStyle = '#e7edf7';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
   ctx.fillText(fmtBytes(max), padLeft + 6, padTop + 12);
 }
 let recordedDays = [];
@@ -868,7 +879,13 @@ async function loadDays() {
   }
   datePicker.value = previous || latestRecordedDate();
   updateDatePickerBounds();
-  drawBars(document.getElementById('dailyChart'), [...recordedDays].reverse(), { labelKey: 'date', color: '#22c55e' });
+  drawBars(document.getElementById('dailyChart'), [...recordedDays].reverse(), {
+    labelKey: 'date',
+    color: '#22c55e',
+    labelFormatter: item => formatDateLabel(item.date),
+    labelMinWidth: 56,
+    maxLabelChars: 5,
+  });
 }
 async function loadSummary() {
   const date = datePicker.value;
@@ -884,7 +901,7 @@ async function loadSummary() {
   document.getElementById('samples').textContent = data.sample_count;
   document.getElementById('csvLink').href = `/api/export.csv?date=${encodeURIComponent(data.date)}`;
   document.getElementById('status').textContent = data.last_sample_at ? `Last sample: ${data.last_sample_at}` : `No samples for ${data.date}`;
-  drawBars(document.getElementById('hourlyChart'), series.series, { labelKey: 'label', color: '#38bdf8' });
+  drawBars(document.getElementById('hourlyChart'), series.series, { labelKey: 'label', color: '#38bdf8', labelMinWidth: 42, maxLabelChars: 5 });
   drawBars(document.getElementById('processChart'), data.processes.slice(0, 10), { labelKey: 'process', color: '#a78bfa', horizontal: true });
   const tbody = document.getElementById('rows');
   tbody.innerHTML = '';

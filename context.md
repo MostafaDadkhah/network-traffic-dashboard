@@ -104,3 +104,9 @@ Reason: Daily review is the core dashboard workflow, and a calendar-style picker
 Decision: Serve a high-contrast inline SVG favicon from `/favicon.svg` and link it from the dashboard HTML instead of adding an external asset pipeline.
 
 Reason: The favicon should make the dashboard easy to find among browser tabs while keeping the zero-runtime-dependency, single-file dashboard architecture.
+
+### 2026-07-04 - Readable chart axis labels
+
+Decision: Render vertical bar-chart x-axis labels horizontally below the plot area, shorten daily labels to `MM/DD`, and skip labels automatically when the chart is dense.
+
+Reason: Rotated date labels can overlap bars and make the dashboard harder to scan. The chart should preserve clear plot/axis separation without adding a charting dependency.

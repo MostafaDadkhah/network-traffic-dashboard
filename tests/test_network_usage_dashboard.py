@@ -118,6 +118,9 @@ def test_dashboard_html_is_english() -> None:
     assert "Previous day" in dashboard.DASHBOARD_HTML
     assert "Next day" in dashboard.DASHBOARD_HTML
     assert "Latest day" in dashboard.DASHBOARD_HTML
+    assert "formatDateLabel" in dashboard.DASHBOARD_HTML
+    assert "labelMinWidth" in dashboard.DASHBOARD_HTML
+    assert "ctx.rotate" not in dashboard.DASHBOARD_HTML
     assert "daySelect" not in dashboard.DASHBOARD_HTML
     assert "No data has been recorded yet." in dashboard.DASHBOARD_HTML
 
