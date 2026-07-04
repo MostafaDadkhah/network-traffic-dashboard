@@ -83,9 +83,15 @@ Reason: It starts automatically at login without requiring root privileges and i
 
 ### 2026-07-03 - GitHub visibility
 
-Decision: Create the GitHub repository as private by default unless Mostafa asks to make it public.
+Decision: Create the GitHub repository as private by default, then switch visibility only after an explicit user decision.
 
 Reason: The project contains no intended sensitive data, but private is the safer default for a local diagnostics tool until publication is explicitly requested.
+
+### 2026-07-04 - Public GitHub repository
+
+Decision: Change the GitHub repository visibility to public after explicit user direction.
+
+Reason: The user wants the macOS dashboard project to be publicly accessible. A tracked-file scan found no credentials or large private artifacts before publishing.
 
 ### 2026-07-03 - App-attributed totals exclude tunnel aggregates
 
