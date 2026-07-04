@@ -12,6 +12,7 @@ The collector samples Apple's `nettop`, stores every sample in SQLite, and serve
 - Hourly app-attributed chart for the selected day.
 - Top app-process chart and table for the selected day.
 - Calendar-style date picker with previous/next/latest recorded-day navigation.
+- High-contrast SVG favicon for quickly spotting the dashboard tab.
 - Separate tunnel aggregate card for `MacPacketTunnel` / `Shadowrocket` transport volume.
 - CSV export for each day.
 - macOS LaunchAgent installer for automatic background collection.

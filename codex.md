@@ -74,8 +74,8 @@ python3 network_usage_dashboard.py --report --data-dir "$tmpdir" --top 5
 HTTP smoke:
 
 1. Start the server with a temporary data dir and `--no-collect` if a sample already exists.
-2. Request `/health`, `/api/today`, `/api/days`, `/api/timeseries`, and `/`.
-3. Verify the HTML contains `Network Traffic Dashboard`.
+2. Request `/health`, `/api/today`, `/api/days`, `/api/timeseries`, `/favicon.svg`, and `/`.
+3. Verify the HTML contains `Network Traffic Dashboard` and links the built-in SVG favicon.
 
 ## LaunchAgent notes
 

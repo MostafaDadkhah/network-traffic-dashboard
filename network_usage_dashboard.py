@@ -634,12 +634,41 @@ def print_report(summary: dict[str, Any], *, top: int) -> None:
         )
 
 
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#172554"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="10" y1="46" x2="54" y2="18">
+      <stop offset="0" stop-color="#22c55e"/>
+      <stop offset="0.55" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+  <path d="M13 45 C22 29 29 39 36 25 S49 22 53 12" fill="none" stroke="#13203c" stroke-width="14" stroke-linecap="round"/>
+  <path d="M13 45 C22 29 29 39 36 25 S49 22 53 12" fill="none" stroke="url(#signal)" stroke-width="6" stroke-linecap="round" filter="url(#glow)"/>
+  <circle cx="13" cy="45" r="6" fill="#22c55e"/>
+  <circle cx="36" cy="25" r="6" fill="#38bdf8"/>
+  <circle cx="53" cy="12" r="6" fill="#a78bfa"/>
+  <path d="M16 53 H48" stroke="#38bdf8" stroke-width="4" stroke-linecap="round" opacity="0.75"/>
+</svg>
+"""
+
+
 DASHBOARD_HTML = """<!doctype html>
 <html lang="en" dir="ltr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Network Traffic Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <meta name="theme-color" content="#0b1020">
   <style>
     :root { color-scheme: dark; }
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0b1020; color: #e7edf7; }
@@ -927,6 +956,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         if parsed.path == "/":
             self.send_bytes(DASHBOARD_HTML.encode("utf-8"), content_type="text/html; charset=utf-8")
+            return
+        if parsed.path in {"/favicon.svg", "/favicon.ico"}:
+            self.send_bytes(FAVICON_SVG.encode("utf-8"), content_type="image/svg+xml; charset=utf-8")
             return
         if parsed.path == "/health":
             payload = {

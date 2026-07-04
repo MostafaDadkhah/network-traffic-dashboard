@@ -112,6 +112,7 @@ def test_export_csv_contains_process_totals(tmp_path) -> None:
 def test_dashboard_html_is_english() -> None:
     assert '<html lang="en"' in dashboard.DASHBOARD_HTML
     assert "Network Traffic Dashboard" in dashboard.DASHBOARD_HTML
+    assert 'rel="icon" type="image/svg+xml" href="/favicon.svg"' in dashboard.DASHBOARD_HTML
     assert "Pre-tunnel app-attributed traffic" in dashboard.DASHBOARD_HTML
     assert 'id="datePicker" type="date"' in dashboard.DASHBOARD_HTML
     assert "Previous day" in dashboard.DASHBOARD_HTML
@@ -119,3 +120,10 @@ def test_dashboard_html_is_english() -> None:
     assert "Latest day" in dashboard.DASHBOARD_HTML
     assert "daySelect" not in dashboard.DASHBOARD_HTML
     assert "No data has been recorded yet." in dashboard.DASHBOARD_HTML
+
+
+def test_favicon_svg_is_browser_visible() -> None:
+    assert dashboard.FAVICON_SVG.startswith('<svg xmlns="http://www.w3.org/2000/svg"')
+    assert 'viewBox="0 0 64 64"' in dashboard.FAVICON_SVG
+    assert "#22c55e" in dashboard.FAVICON_SVG
+    assert "#38bdf8" in dashboard.FAVICON_SVG

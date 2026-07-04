@@ -98,3 +98,9 @@ Reason: Ranking `MacPacketTunnel` as the top process answers the wrong question.
 Decision: Use a browser-native `input type="date"` control plus previous/next/latest recorded-day buttons instead of a plain select dropdown.
 
 Reason: Daily review is the core dashboard workflow, and a calendar-style picker makes it faster to jump between dates while preserving the zero-dependency dashboard implementation.
+
+### 2026-07-04 - Built-in SVG favicon
+
+Decision: Serve a high-contrast inline SVG favicon from `/favicon.svg` and link it from the dashboard HTML instead of adding an external asset pipeline.
+
+Reason: The favicon should make the dashboard easy to find among browser tabs while keeping the zero-runtime-dependency, single-file dashboard architecture.
