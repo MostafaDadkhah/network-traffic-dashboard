@@ -116,3 +116,9 @@ Reason: The favicon should make the dashboard easy to find among browser tabs wh
 Decision: Render vertical bar-chart x-axis labels horizontally below the plot area, shorten daily labels to `MM/DD`, and skip labels automatically when the chart is dense.
 
 Reason: Rotated date labels can overlap bars and make the dashboard harder to scan. The chart should preserve clear plot/axis separation without adding a charting dependency.
+
+### 2026-07-04 - Chart hover value breakdowns
+
+Decision: Add zero-dependency canvas hover tooltips for dashboard charts. Hovering a daily, hourly, or top-process bar shows total, download, and upload values for that bar.
+
+Reason: The dashboard should expose exact values without forcing the user to read only approximate bar heights or switch to the table/CSV.

@@ -686,9 +686,14 @@ DASHBOARD_HTML = """<!doctype html>
     button:hover, a.button:hover { background: #22304f; cursor: pointer; }
     button:disabled { opacity: .45; cursor: not-allowed; }
     .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; margin: 18px 0; }
-    .chart-card { background: #11182c; border: 1px solid #25304a; border-radius: 14px; padding: 16px; }
+    .chart-card { position: relative; background: #11182c; border: 1px solid #25304a; border-radius: 14px; padding: 16px; }
     .chart-title { margin: 0 0 10px; color: #c7d2fe; font-size: 14px; }
     canvas { width: 100%; height: 250px; display: block; }
+    .chart-tooltip { position: fixed; z-index: 20; pointer-events: none; min-width: 170px; padding: 10px 12px; border-radius: 12px; border: 1px solid #405174; background: rgba(9, 14, 28, .96); box-shadow: 0 18px 44px rgba(0, 0, 0, .38); color: #e7edf7; font-size: 12px; opacity: 0; transform: translate(10px, 10px); transition: opacity .08s ease; }
+    .chart-tooltip.visible { opacity: 1; }
+    .chart-tooltip .tooltip-title { margin-bottom: 7px; color: #c7d2fe; font-weight: 700; }
+    .chart-tooltip .tooltip-row { display: flex; justify-content: space-between; gap: 18px; margin-top: 4px; color: #aebddb; }
+    .chart-tooltip .tooltip-row strong { color: #e7edf7; font-weight: 700; }
     table { width: 100%; border-collapse: collapse; background: #11182c; border: 1px solid #25304a; border-radius: 14px; overflow: hidden; }
     th, td { padding: 11px 12px; border-bottom: 1px solid #202a42; text-align: left; }
     th { background: #151f38; color: #aebddb; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
@@ -733,6 +738,7 @@ DASHBOARD_HTML = """<!doctype html>
     </table>
     <footer id="footer"></footer>
   </main>
+  <div id="chartTooltip" class="chart-tooltip" role="status" aria-live="polite"></div>
 <script>
 const fmtBytes = (value) => {
   let n = Number(value || 0);
@@ -747,6 +753,45 @@ const formatDateLabel = (value) => {
   return parts.length === 3 ? `${parts[1]}/${parts[2]}` : String(value || '').slice(0, 8);
 };
 const escapeHtml = (s) => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const chartTooltip = document.getElementById('chartTooltip');
+function tooltipHtml(item, title) {
+  return `<div class="tooltip-title">${escapeHtml(title)}</div>` +
+    `<div class="tooltip-row"><span>Total</span><strong>${fmtBytes(item.total_bytes)}</strong></div>` +
+    `<div class="tooltip-row"><span>Download</span><strong>${fmtBytes(item.bytes_in)}</strong></div>` +
+    `<div class="tooltip-row"><span>Upload</span><strong>${fmtBytes(item.bytes_out)}</strong></div>`;
+}
+function placeTooltip(event) {
+  const margin = 14;
+  const rect = chartTooltip.getBoundingClientRect();
+  let left = event.clientX + 14;
+  let top = event.clientY + 14;
+  if (left + rect.width + margin > window.innerWidth) left = event.clientX - rect.width - 14;
+  if (top + rect.height + margin > window.innerHeight) top = event.clientY - rect.height - 14;
+  chartTooltip.style.left = `${Math.max(margin, left)}px`;
+  chartTooltip.style.top = `${Math.max(margin, top)}px`;
+}
+function hideTooltip() {
+  chartTooltip.classList.remove('visible');
+}
+function attachChartTooltip(canvas) {
+  if (canvas.dataset.tooltipReady === '1') return;
+  canvas.dataset.tooltipReady = '1';
+  canvas.addEventListener('mousemove', event => {
+    const rect = canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    const regions = canvas.__chartHitRegions || [];
+    const hit = regions.find(region => x >= region.x && x <= region.x + region.width && y >= region.y && y <= region.y + region.height);
+    if (!hit) {
+      hideTooltip();
+      return;
+    }
+    chartTooltip.innerHTML = tooltipHtml(hit.item, hit.label);
+    chartTooltip.classList.add('visible');
+    placeTooltip(event);
+  });
+  canvas.addEventListener('mouseleave', hideTooltip);
+}
 function prepareCanvas(canvas) {
   const ratio = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -757,11 +802,14 @@ function prepareCanvas(canvas) {
   return { ctx, width: rect.width, height: rect.height };
 }
 function drawBars(canvas, items, options = {}) {
+  attachChartTooltip(canvas);
   const { ctx, width, height } = prepareCanvas(canvas);
+  const hitRegions = [];
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = '#97a5c0';
   ctx.font = '12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
   if (!items.length) {
+    canvas.__chartHitRegions = [];
     ctx.fillText('No data yet', 14, 28);
     return;
   }
@@ -790,15 +838,18 @@ function drawBars(canvas, items, options = {}) {
       const y = padTop + idx * (barH + gap);
       const value = Number(item[valueKey] || 0);
       const barW = Math.max(1, (value / max) * chartW);
+      const label = String(labelFormatter(item, idx));
       ctx.fillStyle = '#9fb0d0';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'alphabetic';
-      ctx.fillText(String(labelFormatter(item, idx)).slice(0, 16), 8, y + barH * 0.75);
+      ctx.fillText(label.slice(0, 16), 8, y + barH * 0.75);
       ctx.fillStyle = color;
       ctx.fillRect(padLeft, y, barW, barH);
+      hitRegions.push({ x: 0, y, width: Math.max(padLeft + barW, padLeft + 14), height: barH, item, label });
       ctx.fillStyle = '#e7edf7';
       ctx.fillText(fmtBytes(value), Math.min(padLeft + barW + 6, width - 76), y + barH * 0.75);
     });
+    canvas.__chartHitRegions = hitRegions;
     return;
   }
   const gap = Math.max(2, Math.min(8, chartW / Math.max(items.length * 8, 1)));
@@ -808,15 +859,18 @@ function drawBars(canvas, items, options = {}) {
     const barH = (value / max) * chartH;
     const x = padLeft + idx * (barW + gap);
     const y = padTop + chartH - barH;
+    const label = String(labelFormatter(item, idx));
     ctx.fillStyle = color;
     ctx.fillRect(x, y, barW, barH);
+    hitRegions.push({ x, y, width: barW, height: Math.max(3, barH), item, label });
     if (idx % labelEvery === 0 || idx === items.length - 1) {
       ctx.fillStyle = '#9fb0d0';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
-      ctx.fillText(String(labelFormatter(item, idx)).slice(0, options.maxLabelChars || 8), x + barW / 2, padTop + chartH + 10);
+      ctx.fillText(label.slice(0, options.maxLabelChars || 8), x + barW / 2, padTop + chartH + 10);
     }
   });
+  canvas.__chartHitRegions = hitRegions;
   ctx.fillStyle = '#e7edf7';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
