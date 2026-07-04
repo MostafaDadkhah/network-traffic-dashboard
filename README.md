@@ -4,6 +4,12 @@ A macOS-only, zero-runtime-dependency network traffic dashboard for figuring out
 
 The collector samples Apple's `nettop`, stores every sample in SQLite, and serves a local dashboard with daily, hourly, and per-process charts. The main dashboard view reports app-attributed traffic before the tunnel and keeps tunnel transport aggregates separate so `MacPacketTunnel` does not hide the real app ranking.
 
+## Screenshot
+
+macOS-only local dashboard screenshot, captured from the dashboard page itself without browser chrome, desktop chrome, or OS UI.
+
+![macOS Network Traffic Dashboard screenshot](docs/dashboard.png)
+
 ## Features
 
 - Per-process traffic attribution using `nettop -P -x -d -L 2 -s <interval> -n`.
