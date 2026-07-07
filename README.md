@@ -20,6 +20,7 @@ The collector samples Apple's `nettop`, stores every sample in SQLite, and serve
 - High-contrast SVG favicon for quickly spotting the dashboard tab.
 - Separate tunnel aggregate card for `MacPacketTunnel` / `Shadowrocket` transport volume.
 - CSV export for each day.
+- Optional PostgreSQL archive sync: keep today in local SQLite, read completed days from the archive, and prune synced completed days from local storage.
 - macOS LaunchAgent installer for automatic background collection.
 - No runtime Python packages beyond the standard library.
 
@@ -57,6 +58,60 @@ The database stores:
 - `errors`: collector errors, if any.
 - `metadata`: schema version and future metadata.
 
+By default all data stays in this local SQLite database. If optional archive sync
+is configured, the dashboard keeps current-day data locally and treats completed
+days as archive data:
+
+- Today is read from local SQLite.
+- Previous days are synced to PostgreSQL and read from PostgreSQL.
+- After a completed day is verified in PostgreSQL, it is deleted from local
+  SQLite and the local database is vacuumed to keep disk usage low.
+- If no archive database is configured, nothing changes and all days remain
+  local.
+
+Archive sync uses the `psql` command-line client so the app can stay
+dependency-free.
+
+### Optional PostgreSQL archive sync
+
+Set a PostgreSQL URL when running the dashboard:
+
+```bash
+NETWORK_TRAFFIC_SYNC_DATABASE_URL='postgresql://user@host:5432/database' \
+NETWORK_TRAFFIC_SYNC_PSQL=/path/to/psql \
+python3 network_usage_dashboard.py --serve 127.0.0.1:18686 --interval 60
+```
+
+Password options:
+
+- Put credentials in `.pgpass`, a `pg_service.conf` setup, or the URL if that is
+  acceptable for your machine.
+- On macOS, store the password in Keychain and pass the service/account:
+
+```bash
+security add-generic-password -U \
+  -s network-traffic-archive-db \
+  -a user \
+  -w 'your-postgres-password'
+
+NETWORK_TRAFFIC_SYNC_DATABASE_URL='postgresql://user@host:5432/database' \
+NETWORK_TRAFFIC_SYNC_KEYCHAIN_SERVICE=network-traffic-archive-db \
+NETWORK_TRAFFIC_SYNC_KEYCHAIN_ACCOUNT=user \
+python3 network_usage_dashboard.py --serve 127.0.0.1:18686 --interval 60
+```
+
+Sync completed local days once and exit:
+
+```bash
+python3 network_usage_dashboard.py --sync-completed-days
+```
+
+Keep synced completed days locally instead of pruning them:
+
+```bash
+python3 network_usage_dashboard.py --no-sync-prune --serve
+```
+
 ## Install as a macOS LaunchAgent
 
 ```bash
@@ -75,6 +130,16 @@ Override examples:
 
 ```bash
 INTERVAL=30 BIND=127.0.0.1:18687 ./install_network_dashboard_launch_agent.sh
+```
+
+Enable optional archive sync in the LaunchAgent:
+
+```bash
+SYNC_DB_URL='postgresql://user@host:5432/database' \
+SYNC_PSQL=/path/to/psql \
+SYNC_KEYCHAIN_SERVICE=network-traffic-archive-db \
+SYNC_KEYCHAIN_ACCOUNT=user \
+./install_network_dashboard_launch_agent.sh
 ```
 
 ## Uninstall LaunchAgent
@@ -121,6 +186,9 @@ CSV export is available from the dashboard:
 - `GET /api/days`
 - `GET /api/timeseries?date=YYYY-MM-DD`
 - `GET /api/export.csv?date=YYYY-MM-DD`
+
+When archive sync is configured, these APIs automatically read current-day data
+from SQLite and completed-day data from PostgreSQL.
 
 ## Development
 

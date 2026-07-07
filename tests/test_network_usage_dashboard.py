@@ -109,6 +109,69 @@ def test_export_csv_contains_process_totals(tmp_path) -> None:
     assert "node,110,90,200" in csv_text
 
 
+def test_completed_local_days_respects_today_and_keep_window(tmp_path) -> None:
+    rows = [dashboard.ProcessDelta("node.123", "node", 123, 100, 50)]
+    dashboard.append_sample_record(
+        tmp_path,
+        rows,
+        interval_seconds=1,
+        timestamp=datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    dashboard.append_sample_record(
+        tmp_path,
+        rows,
+        interval_seconds=1,
+        timestamp=datetime(2026, 7, 4, 0, 1, 0, tzinfo=timezone.utc),
+    )
+
+    sync_config = dashboard.SyncConfig(database_url="postgresql://user@example.test/archive")
+    assert dashboard.completed_local_days(tmp_path, sync_config, today="2026-07-04") == ["2026-07-03"]
+
+    keep_yesterday = dashboard.SyncConfig(
+        database_url="postgresql://user@example.test/archive",
+        keep_local_days=1,
+    )
+    assert dashboard.completed_local_days(tmp_path, keep_yesterday, today="2026-07-04") == []
+
+
+def test_delete_local_day_only_removes_selected_day(tmp_path) -> None:
+    rows = [dashboard.ProcessDelta("node.123", "node", 123, 100, 50)]
+    dashboard.append_sample_record(
+        tmp_path,
+        rows,
+        interval_seconds=1,
+        timestamp=datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    dashboard.append_sample_record(
+        tmp_path,
+        rows,
+        interval_seconds=1,
+        timestamp=datetime(2026, 7, 4, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    dashboard.delete_local_day(tmp_path, "2026-07-03", vacuum=False)
+
+    assert dashboard.summarize_day(tmp_path, "2026-07-03")["sample_count"] == 0
+    assert dashboard.summarize_day(tmp_path, "2026-07-04")["sample_count"] == 1
+
+
+def test_postgres_env_and_redaction_do_not_expose_password() -> None:
+    sync_config = dashboard.SyncConfig(
+        database_url="postgresql://user:secret@example.test:5433/archive?sslmode=require&application_name=ntd"
+    )
+
+    env = dashboard.postgres_env(sync_config)
+
+    assert env["PGHOST"] == "example.test"
+    assert env["PGPORT"] == "5433"
+    assert env["PGDATABASE"] == "archive"
+    assert env["PGUSER"] == "user"
+    assert env["PGPASSWORD"] == "secret"
+    assert env["PGSSLMODE"] == "require"
+    assert env["PGAPPNAME"] == "ntd"
+    assert "secret" not in dashboard.redacted_database_url(sync_config.database_url)
+
+
 def test_dashboard_html_is_english() -> None:
     assert '<html lang="en"' in dashboard.DASHBOARD_HTML
     assert "Network Traffic Dashboard" in dashboard.DASHBOARD_HTML

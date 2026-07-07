@@ -16,19 +16,24 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.parse
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable, cast
+from typing import Any, Iterable, Sequence, cast
 
 APP_NAME = "NetworkTrafficDashboard"
 DEFAULT_BIND = "127.0.0.1:18686"
 DEFAULT_INTERVAL_SECONDS = 60
 SCHEMA_VERSION = 2
 DATABASE_FILENAME = "network_traffic.sqlite3"
+SYNC_DATABASE_URL_ENV = "NETWORK_TRAFFIC_SYNC_DATABASE_URL"
+SYNC_PSQL_ENV = "NETWORK_TRAFFIC_SYNC_PSQL"
+SYNC_KEYCHAIN_SERVICE_ENV = "NETWORK_TRAFFIC_SYNC_KEYCHAIN_SERVICE"
+SYNC_KEYCHAIN_ACCOUNT_ENV = "NETWORK_TRAFFIC_SYNC_KEYCHAIN_ACCOUNT"
 
 
 def default_data_dir() -> Path:
@@ -56,11 +61,29 @@ class ProcessDelta:
         return data
 
 
+@dataclass(frozen=True)
+class SyncConfig:
+    database_url: str | None = None
+    psql_path: str = "psql"
+    keychain_service: str | None = None
+    keychain_account: str | None = None
+    prune_after_sync: bool = True
+    keep_local_days: int = 0
+    connect_timeout: int = 15
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.database_url)
+
+
 class CollectorState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.last_sample_at: str | None = None
         self.last_error: str | None = None
+        self.last_sync_at: str | None = None
+        self.last_sync_error: str | None = None
+        self.last_sync_days: list[str] = []
         self.last_process_count = 0
         self.last_total_bytes = 0
         self.samples_written = 0
@@ -77,11 +100,20 @@ class CollectorState:
         with self._lock:
             self.last_error = error
 
+    def record_sync(self, days: list[str], error: str | None = None) -> None:
+        with self._lock:
+            self.last_sync_at = local_now().isoformat(timespec="seconds")
+            self.last_sync_error = error
+            self.last_sync_days = days
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "last_sample_at": self.last_sample_at,
                 "last_error": self.last_error,
+                "last_sync_at": self.last_sync_at,
+                "last_sync_error": self.last_sync_error,
+                "last_sync_days": self.last_sync_days,
                 "last_process_count": self.last_process_count,
                 "last_total_bytes": self.last_total_bytes,
                 "samples_written": self.samples_written,
@@ -199,6 +231,136 @@ def day_string(timestamp: datetime | None = None) -> str:
     return stamp.astimezone().date().isoformat()
 
 
+def parse_date(value: str) -> datetime.date:
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def today_cutoff_date(keep_local_days: int, today: str | None = None) -> str:
+    current = parse_date(today or day_string())
+    return (current - timedelta(days=max(0, keep_local_days))).isoformat()
+
+
+def redacted_database_url(database_url: str | None) -> str:
+    if not database_url:
+        return ""
+    parsed = urllib.parse.urlparse(database_url)
+    if parsed.password is None:
+        return database_url
+    user = urllib.parse.quote(urllib.parse.unquote(parsed.username or ""), safe="")
+    netloc = f"{user}:***@{parsed.hostname or ''}"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+
+
+def postgres_env(sync_config: SyncConfig) -> dict[str, str]:
+    if not sync_config.database_url:
+        raise ValueError("sync database URL is not configured")
+    parsed = urllib.parse.urlparse(sync_config.database_url)
+    if parsed.scheme not in {"postgresql", "postgres"}:
+        raise ValueError("sync database URL must use postgresql://")
+    env = os.environ.copy()
+    if parsed.hostname:
+        env["PGHOST"] = parsed.hostname
+    if parsed.port:
+        env["PGPORT"] = str(parsed.port)
+    database = urllib.parse.unquote(parsed.path.lstrip("/")) if parsed.path else ""
+    if database:
+        env["PGDATABASE"] = database
+    if parsed.username:
+        env["PGUSER"] = urllib.parse.unquote(parsed.username)
+    if parsed.password:
+        env["PGPASSWORD"] = urllib.parse.unquote(parsed.password)
+    elif sync_config.keychain_service and sync_config.keychain_account:
+        password = keychain_password(sync_config.keychain_service, sync_config.keychain_account)
+        if password:
+            env["PGPASSWORD"] = password
+    query = urllib.parse.parse_qs(parsed.query)
+    query_env = {
+        "sslmode": "PGSSLMODE",
+        "hostaddr": "PGHOSTADDR",
+        "connect_timeout": "PGCONNECT_TIMEOUT",
+        "application_name": "PGAPPNAME",
+    }
+    for key, env_name in query_env.items():
+        values = query.get(key)
+        if values:
+            env[env_name] = values[-1]
+    env.setdefault("PGCONNECT_TIMEOUT", str(sync_config.connect_timeout))
+    return env
+
+
+def keychain_password(service: str, account: str) -> str | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        return subprocess.check_output(
+            ["security", "find-generic-password", "-w", "-s", service, "-a", account],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def run_psql(
+    sync_config: SyncConfig,
+    args: Sequence[str],
+    *,
+    input_text: str | None = None,
+    capture: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    if not sync_config.enabled:
+        raise ValueError("sync database is not configured")
+    command = [sync_config.psql_path, "-X", *args]
+    return subprocess.run(
+        command,
+        input=input_text,
+        capture_output=capture,
+        text=True,
+        env=postgres_env(sync_config),
+        check=False,
+    )
+
+
+def run_psql_checked(sync_config: SyncConfig, args: Sequence[str], *, input_text: str | None = None) -> str:
+    completed = run_psql(sync_config, args, input_text=input_text, capture=True)
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or f"psql exited with {completed.returncode}").strip()
+        raise RuntimeError(message)
+    return completed.stdout
+
+
+def run_psql_script(sync_config: SyncConfig, sql: str) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".sql", delete=False) as handle:
+        handle.write(sql)
+        script_path = handle.name
+    try:
+        run_psql_checked(sync_config, ["-v", "ON_ERROR_STOP=1", "-f", script_path])
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def psql_json_rows(sync_config: SyncConfig, query: str) -> list[dict[str, Any]]:
+    sql = f"SELECT COALESCE(json_agg(row_to_json(q)), '[]'::json)::text FROM ({query}) q"
+    output = run_psql_checked(sync_config, ["-At", "-v", "ON_ERROR_STOP=1", "-c", sql]).strip()
+    if not output:
+        return []
+    return cast(list[dict[str, Any]], json.loads(output))
+
+
+def psql_json_one(sync_config: SyncConfig, query: str) -> dict[str, Any]:
+    rows = psql_json_rows(sync_config, query)
+    return rows[0] if rows else {}
+
+
 def connect_database(data_dir: Path) -> sqlite3.Connection:
     ensure_data_dirs(data_dir)
     conn = sqlite3.connect(database_path(data_dir))
@@ -262,6 +424,285 @@ def init_database(data_dir: Path) -> Path:
             (str(SCHEMA_VERSION),),
         )
     return database_path(data_dir)
+
+
+REMOTE_SCHEMA_SQL = """
+SET client_min_messages TO WARNING;
+CREATE TABLE IF NOT EXISTS metadata (
+  key text PRIMARY KEY,
+  value text NOT NULL
+);
+CREATE TABLE IF NOT EXISTS samples (
+  id bigint PRIMARY KEY,
+  ts text NOT NULL,
+  date text NOT NULL,
+  source text NOT NULL,
+  interval_seconds integer NOT NULL,
+  total_bytes bigint NOT NULL,
+  bytes_in bigint NOT NULL,
+  bytes_out bigint NOT NULL,
+  process_count integer NOT NULL,
+  created_at text NOT NULL
+);
+CREATE TABLE IF NOT EXISTS process_deltas (
+  id bigint PRIMARY KEY,
+  sample_id bigint NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+  raw_process text NOT NULL,
+  process text NOT NULL,
+  pid bigint,
+  bytes_in bigint NOT NULL,
+  bytes_out bigint NOT NULL,
+  total_bytes bigint NOT NULL,
+  is_tunnel integer NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS errors (
+  id bigint PRIMARY KEY,
+  ts text NOT NULL,
+  date text NOT NULL,
+  error text NOT NULL,
+  created_at text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_samples_date ON samples(date);
+CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
+CREATE INDEX IF NOT EXISTS idx_process_deltas_sample ON process_deltas(sample_id);
+CREATE INDEX IF NOT EXISTS idx_process_deltas_process ON process_deltas(process);
+CREATE INDEX IF NOT EXISTS idx_errors_date ON errors(date);
+"""
+
+SYNC_TABLES = {
+    "samples": [
+        "id",
+        "ts",
+        "date",
+        "source",
+        "interval_seconds",
+        "total_bytes",
+        "bytes_in",
+        "bytes_out",
+        "process_count",
+        "created_at",
+    ],
+    "process_deltas": [
+        "id",
+        "sample_id",
+        "raw_process",
+        "process",
+        "pid",
+        "bytes_in",
+        "bytes_out",
+        "total_bytes",
+        "is_tunnel",
+    ],
+    "errors": ["id", "ts", "date", "error", "created_at"],
+}
+
+
+def ensure_remote_schema(sync_config: SyncConfig) -> None:
+    run_psql_script(sync_config, REMOTE_SCHEMA_SQL)
+
+
+def csv_payload(rows: Iterable[Sequence[Any]]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    for row in rows:
+        writer.writerow(["\\N" if value is None else value for value in row])
+    return buffer.getvalue()
+
+
+def copy_block(table: str, columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    if not rows:
+        return ""
+    return (
+        f"COPY tmp_{table} ({', '.join(columns)}) FROM STDIN WITH (FORMAT csv, NULL '\\N');\n"
+        + csv_payload(rows)
+        + "\\.\n"
+    )
+
+
+def local_day_counts(data_dir: Path, date: str) -> dict[str, int]:
+    init_database(data_dir)
+    with connect_database(data_dir) as conn:
+        samples = int(conn.execute("SELECT COUNT(*) FROM samples WHERE date = ?", (date,)).fetchone()[0] or 0)
+        process_deltas = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM process_deltas d
+                JOIN samples s ON s.id = d.sample_id
+                WHERE s.date = ?
+                """,
+                (date,),
+            ).fetchone()[0]
+            or 0
+        )
+        errors = int(conn.execute("SELECT COUNT(*) FROM errors WHERE date = ?", (date,)).fetchone()[0] or 0)
+    return {"samples": samples, "process_deltas": process_deltas, "errors": errors}
+
+
+def remote_day_counts(sync_config: SyncConfig, date: str) -> dict[str, int]:
+    quoted_date = sql_literal(date)
+    row = psql_json_one(
+        sync_config,
+        f"""
+        SELECT
+          (SELECT COUNT(*) FROM samples WHERE date = {quoted_date})::bigint AS samples,
+          (
+            SELECT COUNT(*)
+            FROM process_deltas d
+            JOIN samples s ON s.id = d.sample_id
+            WHERE s.date = {quoted_date}
+          )::bigint AS process_deltas,
+          (SELECT COUNT(*) FROM errors WHERE date = {quoted_date})::bigint AS errors
+        """,
+    )
+    return {
+        "samples": int(row.get("samples") or 0),
+        "process_deltas": int(row.get("process_deltas") or 0),
+        "errors": int(row.get("errors") or 0),
+    }
+
+
+def completed_local_days(data_dir: Path, sync_config: SyncConfig, *, today: str | None = None) -> list[str]:
+    cutoff = today_cutoff_date(sync_config.keep_local_days, today)
+    init_database(data_dir)
+    with connect_database(data_dir) as conn:
+        rows = conn.execute(
+            """
+            SELECT date
+            FROM (
+              SELECT date FROM samples
+              UNION
+              SELECT date FROM errors
+            )
+            WHERE date < ?
+            ORDER BY date ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+    return [str(row["date"]) for row in rows]
+
+
+def sync_sql_for_day(data_dir: Path, date: str) -> str:
+    init_database(data_dir)
+    with connect_database(data_dir) as conn:
+        metadata = [tuple(row) for row in conn.execute("SELECT key, value FROM metadata ORDER BY key")]
+        samples = [
+            tuple(row)
+            for row in conn.execute(
+                f"SELECT {', '.join(SYNC_TABLES['samples'])} FROM samples WHERE date = ? ORDER BY id",
+                (date,),
+            )
+        ]
+        process_deltas = [
+            tuple(row)
+            for row in conn.execute(
+                f"""
+                SELECT {', '.join('d.' + column for column in SYNC_TABLES['process_deltas'])}
+                FROM process_deltas d
+                JOIN samples s ON s.id = d.sample_id
+                WHERE s.date = ?
+                ORDER BY d.id
+                """,
+                (date,),
+            )
+        ]
+        errors = [
+            tuple(row)
+            for row in conn.execute(
+                f"SELECT {', '.join(SYNC_TABLES['errors'])} FROM errors WHERE date = ? ORDER BY id",
+                (date,),
+            )
+        ]
+
+    sql = REMOTE_SCHEMA_SQL
+    sql += """
+CREATE TEMP TABLE tmp_metadata (key text, value text);
+CREATE TEMP TABLE tmp_samples (LIKE samples INCLUDING DEFAULTS);
+CREATE TEMP TABLE tmp_process_deltas (LIKE process_deltas INCLUDING DEFAULTS);
+CREATE TEMP TABLE tmp_errors (LIKE errors INCLUDING DEFAULTS);
+"""
+    sql += copy_block("metadata", ["key", "value"], metadata)
+    sql += copy_block("samples", SYNC_TABLES["samples"], samples)
+    sql += copy_block("process_deltas", SYNC_TABLES["process_deltas"], process_deltas)
+    sql += copy_block("errors", SYNC_TABLES["errors"], errors)
+    sql += """
+INSERT INTO metadata (key, value)
+SELECT key, value FROM tmp_metadata
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+INSERT INTO samples
+SELECT * FROM tmp_samples
+ON CONFLICT (id) DO UPDATE SET
+  ts = EXCLUDED.ts,
+  date = EXCLUDED.date,
+  source = EXCLUDED.source,
+  interval_seconds = EXCLUDED.interval_seconds,
+  total_bytes = EXCLUDED.total_bytes,
+  bytes_in = EXCLUDED.bytes_in,
+  bytes_out = EXCLUDED.bytes_out,
+  process_count = EXCLUDED.process_count,
+  created_at = EXCLUDED.created_at;
+INSERT INTO process_deltas
+SELECT * FROM tmp_process_deltas
+ON CONFLICT (id) DO UPDATE SET
+  sample_id = EXCLUDED.sample_id,
+  raw_process = EXCLUDED.raw_process,
+  process = EXCLUDED.process,
+  pid = EXCLUDED.pid,
+  bytes_in = EXCLUDED.bytes_in,
+  bytes_out = EXCLUDED.bytes_out,
+  total_bytes = EXCLUDED.total_bytes,
+  is_tunnel = EXCLUDED.is_tunnel;
+INSERT INTO errors
+SELECT * FROM tmp_errors
+ON CONFLICT (id) DO UPDATE SET
+  ts = EXCLUDED.ts,
+  date = EXCLUDED.date,
+  error = EXCLUDED.error,
+  created_at = EXCLUDED.created_at;
+"""
+    return sql
+
+
+def delete_local_day(data_dir: Path, date: str, *, vacuum: bool = True) -> None:
+    init_database(data_dir)
+    with connect_database(data_dir) as conn:
+        conn.execute(
+            """
+            DELETE FROM process_deltas
+            WHERE sample_id IN (SELECT id FROM samples WHERE date = ?)
+            """,
+            (date,),
+        )
+        conn.execute("DELETE FROM samples WHERE date = ?", (date,))
+        conn.execute("DELETE FROM errors WHERE date = ?", (date,))
+    if vacuum:
+        with connect_database(data_dir) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+
+
+def sync_completed_days(data_dir: Path, sync_config: SyncConfig, *, today: str | None = None) -> list[str]:
+    if not sync_config.enabled:
+        return []
+    synced: list[str] = []
+    ensure_remote_schema(sync_config)
+    for date in completed_local_days(data_dir, sync_config, today=today):
+        local_counts = local_day_counts(data_dir, date)
+        if sum(local_counts.values()) == 0:
+            continue
+        run_psql_script(sync_config, sync_sql_for_day(data_dir, date))
+        remote_counts = remote_day_counts(sync_config, date)
+        missing = [
+            name
+            for name, count in local_counts.items()
+            if int(remote_counts.get(name) or 0) < int(count or 0)
+        ]
+        if missing:
+            raise RuntimeError(f"remote sync verification failed for {date}: {', '.join(missing)}")
+        if sync_config.prune_after_sync:
+            delete_local_day(data_dir, date)
+        synced.append(date)
+    return synced
 
 
 def append_sample_record(
@@ -345,6 +786,7 @@ def empty_summary(data_dir: Path, date: str) -> dict[str, Any]:
         "date": date,
         "exists": database_path(data_dir).exists(),
         "database_path": str(database_path(data_dir)),
+        "storage": "local",
         "sample_count": 0,
         "error_count": 0,
         "first_sample_at": None,
@@ -378,8 +820,25 @@ def normalize_process_rows(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return normalized
 
 
-def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | None = None) -> dict[str, Any]:
+def should_read_remote(sync_config: SyncConfig | None, date: str) -> bool:
+    return bool(sync_config and sync_config.enabled and date < day_string())
+
+
+def summarize_day(
+    data_dir: Path,
+    date: str | None = None,
+    *,
+    top_limit: int | None = None,
+    sync_config: SyncConfig | None = None,
+) -> dict[str, Any]:
     selected_date = date or day_string()
+    if should_read_remote(sync_config, selected_date):
+        try:
+            return summarize_day_remote(sync_config, data_dir, selected_date, top_limit=top_limit)
+        except Exception:
+            # If the optional archive is unavailable, keep the dashboard usable.
+            # A pruned local day may still return an empty local summary.
+            pass
     init_database(data_dir)
     with connect_database(data_dir) as conn:
         sample_stats = conn.execute(
@@ -482,6 +941,7 @@ def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | N
         "date": selected_date,
         "exists": True,
         "database_path": str(database_path(data_dir)),
+        "storage": "local",
         "sample_count": int(sample_stats["sample_count"] or 0),
         "error_count": int(error_stats["error_count"] or 0) if error_stats else 0,
         "first_sample_at": sample_stats["first_sample_at"],
@@ -503,7 +963,123 @@ def summarize_day(data_dir: Path, date: str | None = None, *, top_limit: int | N
     }
 
 
-def list_days(data_dir: Path) -> list[dict[str, Any]]:
+def summarize_day_remote(
+    sync_config: SyncConfig,
+    data_dir: Path,
+    date: str,
+    *,
+    top_limit: int | None = None,
+) -> dict[str, Any]:
+    ensure_remote_schema(sync_config)
+    selected_date = sql_literal(date)
+    sample_stats = psql_json_one(
+        sync_config,
+        f"""
+        SELECT COUNT(*)::bigint AS sample_count,
+               MIN(ts) AS first_sample_at,
+               MAX(ts) AS last_sample_at
+        FROM samples
+        WHERE date = {selected_date}
+        """,
+    )
+    error_stats = psql_json_one(
+        sync_config,
+        f"""
+        SELECT COUNT(*)::bigint AS error_count, MAX(error) AS last_error
+        FROM errors
+        WHERE date = {selected_date}
+        """,
+    )
+    if int(sample_stats.get("sample_count") or 0) == 0:
+        summary = empty_summary(data_dir, date)
+        summary["exists"] = True
+        summary["database_path"] = redacted_database_url(sync_config.database_url)
+        summary["storage"] = "remote"
+        summary["error_count"] = int(error_stats.get("error_count") or 0)
+        summary["last_error"] = error_stats.get("last_error")
+        return summary
+
+    traffic_stats = psql_json_one(
+        sync_config,
+        f"""
+        SELECT COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_in ELSE 0 END), 0)::bigint AS bytes_in,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_out ELSE 0 END), 0)::bigint AS bytes_out,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.total_bytes ELSE 0 END), 0)::bigint AS total_bytes,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_in ELSE 0 END), 0)::bigint AS tunnel_bytes_in,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_out ELSE 0 END), 0)::bigint AS tunnel_bytes_out,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.total_bytes ELSE 0 END), 0)::bigint AS tunnel_total_bytes,
+               COALESCE(SUM(d.bytes_in), 0)::bigint AS observed_bytes_in,
+               COALESCE(SUM(d.bytes_out), 0)::bigint AS observed_bytes_out,
+               COALESCE(SUM(d.total_bytes), 0)::bigint AS observed_total_bytes
+        FROM process_deltas d
+        JOIN samples s ON s.id = d.sample_id
+        WHERE s.date = {selected_date}
+        """,
+    )
+
+    limit_sql = f" LIMIT {int(top_limit)}" if top_limit is not None else ""
+    process_select = f"""
+        SELECT d.process AS process,
+               COALESCE(SUM(d.bytes_in), 0)::bigint AS bytes_in,
+               COALESCE(SUM(d.bytes_out), 0)::bigint AS bytes_out,
+               COALESCE(SUM(d.total_bytes), 0)::bigint AS total_bytes,
+               COUNT(*)::bigint AS samples,
+               MAX(d.is_tunnel)::integer AS is_tunnel,
+               STRING_AGG(DISTINCT d.pid::text, ',') FILTER (WHERE d.pid IS NOT NULL) AS pids
+        FROM process_deltas d
+        JOIN samples s ON s.id = d.sample_id
+        WHERE s.date = {selected_date} AND d.is_tunnel = {{is_tunnel}}
+        GROUP BY d.process
+        ORDER BY total_bytes DESC
+    """
+    process_rows = normalize_process_rows(psql_json_rows(sync_config, process_select.format(is_tunnel=0) + limit_sql))
+    tunnel_rows = normalize_process_rows(psql_json_rows(sync_config, process_select.format(is_tunnel=1)))
+
+    latest_sample = psql_json_one(
+        sync_config,
+        f"SELECT id FROM samples WHERE date = {selected_date} ORDER BY ts DESC, id DESC LIMIT 1",
+    )
+    latest_rows: list[dict[str, Any]] = []
+    latest_tunnel_rows: list[dict[str, Any]] = []
+    if latest_sample.get("id") is not None:
+        sample_id = int(latest_sample["id"])
+        latest_query = f"""
+            SELECT raw_process, process, pid, bytes_in, bytes_out, total_bytes, is_tunnel
+            FROM process_deltas
+            WHERE sample_id = {sample_id} AND is_tunnel = {{is_tunnel}}
+            ORDER BY total_bytes DESC
+            LIMIT 20
+        """
+        latest_rows = normalize_process_rows(psql_json_rows(sync_config, latest_query.format(is_tunnel=0)))
+        latest_tunnel_rows = normalize_process_rows(psql_json_rows(sync_config, latest_query.format(is_tunnel=1)))
+
+    return {
+        "date": date,
+        "exists": True,
+        "database_path": redacted_database_url(sync_config.database_url),
+        "storage": "remote",
+        "sample_count": int(sample_stats.get("sample_count") or 0),
+        "error_count": int(error_stats.get("error_count") or 0),
+        "first_sample_at": sample_stats.get("first_sample_at"),
+        "last_sample_at": sample_stats.get("last_sample_at"),
+        "last_error": error_stats.get("last_error"),
+        "bytes_in": int(traffic_stats.get("bytes_in") or 0),
+        "bytes_out": int(traffic_stats.get("bytes_out") or 0),
+        "total_bytes": int(traffic_stats.get("total_bytes") or 0),
+        "observed_bytes_in": int(traffic_stats.get("observed_bytes_in") or 0),
+        "observed_bytes_out": int(traffic_stats.get("observed_bytes_out") or 0),
+        "observed_total_bytes": int(traffic_stats.get("observed_total_bytes") or 0),
+        "tunnel_bytes_in": int(traffic_stats.get("tunnel_bytes_in") or 0),
+        "tunnel_bytes_out": int(traffic_stats.get("tunnel_bytes_out") or 0),
+        "tunnel_total_bytes": int(traffic_stats.get("tunnel_total_bytes") or 0),
+        "processes": process_rows,
+        "tunnel_processes": tunnel_rows,
+        "latest_processes": latest_rows,
+        "latest_tunnel_processes": latest_tunnel_rows,
+    }
+
+
+def list_days_local(data_dir: Path) -> list[dict[str, Any]]:
     init_database(data_dir)
     with connect_database(data_dir) as conn:
         day_map: dict[str, dict[str, Any]] = {}
@@ -527,6 +1103,7 @@ def list_days(data_dir: Path) -> list[dict[str, Any]]:
             day_map[row["date"]] = {
                 "date": row["date"],
                 "database_path": str(database_path(data_dir)),
+                "storage": "local",
                 "sample_count": int(row["sample_count"] or 0),
                 "error_count": 0,
                 "total_bytes": int(row["total_bytes"] or 0),
@@ -544,6 +1121,7 @@ def list_days(data_dir: Path) -> list[dict[str, Any]]:
                 {
                     "date": row["date"],
                     "database_path": str(database_path(data_dir)),
+                    "storage": "local",
                     "sample_count": 0,
                     "error_count": 0,
                     "total_bytes": 0,
@@ -560,8 +1138,91 @@ def list_days(data_dir: Path) -> list[dict[str, Any]]:
     return sorted(day_map.values(), key=lambda item: item["date"], reverse=True)
 
 
-def timeseries_day(data_dir: Path, date: str | None = None) -> list[dict[str, Any]]:
+def list_days_remote(sync_config: SyncConfig) -> list[dict[str, Any]]:
+    ensure_remote_schema(sync_config)
+    rows = psql_json_rows(
+        sync_config,
+        """
+        SELECT s.date AS date,
+               COUNT(DISTINCT s.id)::bigint AS sample_count,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_in ELSE 0 END), 0)::bigint AS bytes_in,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_out ELSE 0 END), 0)::bigint AS bytes_out,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.total_bytes ELSE 0 END), 0)::bigint AS total_bytes,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_in ELSE 0 END), 0)::bigint AS tunnel_bytes_in,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.bytes_out ELSE 0 END), 0)::bigint AS tunnel_bytes_out,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.total_bytes ELSE 0 END), 0)::bigint AS tunnel_total_bytes,
+               COALESCE(SUM(d.total_bytes), 0)::bigint AS observed_total_bytes,
+               MAX(s.ts) AS last_sample_at
+        FROM samples s
+        LEFT JOIN process_deltas d ON d.sample_id = s.id
+        GROUP BY s.date
+        """,
+    )
+    day_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        day_map[str(row["date"])] = {
+            "date": row["date"],
+            "database_path": redacted_database_url(sync_config.database_url),
+            "storage": "remote",
+            "sample_count": int(row.get("sample_count") or 0),
+            "error_count": 0,
+            "total_bytes": int(row.get("total_bytes") or 0),
+            "bytes_in": int(row.get("bytes_in") or 0),
+            "bytes_out": int(row.get("bytes_out") or 0),
+            "tunnel_bytes_in": int(row.get("tunnel_bytes_in") or 0),
+            "tunnel_bytes_out": int(row.get("tunnel_bytes_out") or 0),
+            "tunnel_total_bytes": int(row.get("tunnel_total_bytes") or 0),
+            "observed_total_bytes": int(row.get("observed_total_bytes") or 0),
+            "last_sample_at": row.get("last_sample_at"),
+        }
+    for row in psql_json_rows(sync_config, "SELECT date, COUNT(*)::bigint AS error_count FROM errors GROUP BY date"):
+        entry = day_map.setdefault(
+            str(row["date"]),
+            {
+                "date": row["date"],
+                "database_path": redacted_database_url(sync_config.database_url),
+                "storage": "remote",
+                "sample_count": 0,
+                "error_count": 0,
+                "total_bytes": 0,
+                "bytes_in": 0,
+                "bytes_out": 0,
+                "tunnel_bytes_in": 0,
+                "tunnel_bytes_out": 0,
+                "tunnel_total_bytes": 0,
+                "observed_total_bytes": 0,
+                "last_sample_at": None,
+            },
+        )
+        entry["error_count"] = int(row.get("error_count") or 0)
+    return sorted(day_map.values(), key=lambda item: item["date"], reverse=True)
+
+
+def list_days(data_dir: Path, *, sync_config: SyncConfig | None = None) -> list[dict[str, Any]]:
+    local_days = list_days_local(data_dir)
+    if not sync_config or not sync_config.enabled:
+        return local_days
+    try:
+        remote_days = list_days_remote(sync_config)
+    except Exception:
+        return local_days
+    today = day_string()
+    merged: dict[str, dict[str, Any]] = {}
+    for day in local_days:
+        merged[day["date"]] = day
+    for day in remote_days:
+        if str(day["date"]) < today:
+            merged[str(day["date"])] = day
+    return sorted(merged.values(), key=lambda item: item["date"], reverse=True)
+
+
+def timeseries_day(data_dir: Path, date: str | None = None, *, sync_config: SyncConfig | None = None) -> list[dict[str, Any]]:
     selected_date = date or day_string()
+    if should_read_remote(sync_config, selected_date):
+        try:
+            return timeseries_day_remote(sync_config, selected_date)
+        except Exception:
+            pass
     init_database(data_dir)
     with connect_database(data_dir) as conn:
         rows = [
@@ -592,6 +1253,37 @@ def timeseries_day(data_dir: Path, date: str | None = None) -> list[dict[str, An
         row["tunnel_total_bytes"] = int(row["tunnel_total_bytes"] or 0)
         row["observed_total_bytes"] = int(row["observed_total_bytes"] or 0)
         row["sample_count"] = int(row["sample_count"] or 0)
+    return rows
+
+
+def timeseries_day_remote(sync_config: SyncConfig, date: str) -> list[dict[str, Any]]:
+    ensure_remote_schema(sync_config)
+    selected_date = sql_literal(date)
+    rows = psql_json_rows(
+        sync_config,
+        f"""
+        SELECT substr(s.ts, 12, 2) AS hour,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_in ELSE 0 END), 0)::bigint AS bytes_in,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.bytes_out ELSE 0 END), 0)::bigint AS bytes_out,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 0 THEN d.total_bytes ELSE 0 END), 0)::bigint AS total_bytes,
+               COALESCE(SUM(CASE WHEN d.is_tunnel = 1 THEN d.total_bytes ELSE 0 END), 0)::bigint AS tunnel_total_bytes,
+               COALESCE(SUM(d.total_bytes), 0)::bigint AS observed_total_bytes,
+               COUNT(DISTINCT s.id)::bigint AS sample_count
+        FROM samples s
+        LEFT JOIN process_deltas d ON d.sample_id = s.id
+        WHERE s.date = {selected_date}
+        GROUP BY hour
+        ORDER BY hour ASC
+        """,
+    )
+    for row in rows:
+        row["label"] = f"{row['hour']}:00"
+        row["bytes_in"] = int(row.get("bytes_in") or 0)
+        row["bytes_out"] = int(row.get("bytes_out") or 0)
+        row["total_bytes"] = int(row.get("total_bytes") or 0)
+        row["tunnel_total_bytes"] = int(row.get("tunnel_total_bytes") or 0)
+        row["observed_total_bytes"] = int(row.get("observed_total_bytes") or 0)
+        row["sample_count"] = int(row.get("sample_count") or 0)
     return rows
 
 
@@ -993,10 +1685,17 @@ setInterval(() => { loadDays().catch(() => {}); }, 60000);
 
 
 class DashboardServer(ThreadingHTTPServer):
-    def __init__(self, server_address: tuple[str, int], data_dir: Path, state: CollectorState):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        data_dir: Path,
+        state: CollectorState,
+        sync_config: SyncConfig | None,
+    ):
         super().__init__(server_address, DashboardRequestHandler)
         self.data_dir = data_dir
         self.state = state
+        self.sync_config = sync_config
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -1036,28 +1735,47 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "data_dir": str(self.dashboard_server.data_dir),
                 "database_path": str(database_path(self.dashboard_server.data_dir)),
+                "sync": sync_status(self.dashboard_server.sync_config),
                 "pid": os.getpid(),
                 "collector": self.dashboard_server.state.snapshot(),
             }
             self.send_json(payload)
             return
         if parsed.path == "/api/today":
-            self.send_json(summarize_day(self.dashboard_server.data_dir))
+            self.send_json(summarize_day(self.dashboard_server.data_dir, sync_config=self.dashboard_server.sync_config))
             return
         if parsed.path == "/api/day":
             date = first_query_value(query, "date") or day_string()
-            self.send_json(summarize_day(self.dashboard_server.data_dir, date))
+            self.send_json(summarize_day(self.dashboard_server.data_dir, date, sync_config=self.dashboard_server.sync_config))
             return
         if parsed.path == "/api/days":
-            self.send_json({"days": list_days(self.dashboard_server.data_dir), "collector": self.dashboard_server.state.snapshot()})
+            self.send_json(
+                {
+                    "days": list_days(self.dashboard_server.data_dir, sync_config=self.dashboard_server.sync_config),
+                    "collector": self.dashboard_server.state.snapshot(),
+                    "sync": sync_status(self.dashboard_server.sync_config),
+                }
+            )
             return
         if parsed.path == "/api/timeseries":
             date = first_query_value(query, "date") or day_string()
-            self.send_json({"date": date, "series": timeseries_day(self.dashboard_server.data_dir, date)})
+            self.send_json(
+                {
+                    "date": date,
+                    "series": timeseries_day(
+                        self.dashboard_server.data_dir,
+                        date,
+                        sync_config=self.dashboard_server.sync_config,
+                    ),
+                }
+            )
             return
         if parsed.path == "/api/export.csv":
             date = first_query_value(query, "date") or day_string()
-            self.send_bytes(export_csv(self.dashboard_server.data_dir, date), content_type="text/csv; charset=utf-8")
+            self.send_bytes(
+                export_csv(self.dashboard_server.data_dir, date, sync_config=self.dashboard_server.sync_config),
+                content_type="text/csv; charset=utf-8",
+            )
             return
         self.send_json({"error": "not found"}, status=404)
 
@@ -1067,8 +1785,22 @@ def first_query_value(query: dict[str, list[str]], name: str) -> str | None:
     return values[0] if values else None
 
 
-def export_csv(data_dir: Path, date: str) -> bytes:
-    summary = summarize_day(data_dir, date)
+def sync_status(sync_config: SyncConfig | None) -> dict[str, Any]:
+    if not sync_config or not sync_config.enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "database_url": redacted_database_url(sync_config.database_url),
+        "psql_path": sync_config.psql_path,
+        "prune_after_sync": sync_config.prune_after_sync,
+        "keep_local_days": sync_config.keep_local_days,
+        "keychain_account": sync_config.keychain_account,
+        "keychain_service": sync_config.keychain_service,
+    }
+
+
+def export_csv(data_dir: Path, date: str, *, sync_config: SyncConfig | None = None) -> bytes:
+    summary = summarize_day(data_dir, date, sync_config=sync_config)
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(["date", "process", "bytes_in", "bytes_out", "total_bytes", "samples", "pids", "is_tunnel"])
@@ -1103,6 +1835,7 @@ def collector_loop(
     interval_seconds: int,
     nettop_path: str,
     stop_event: threading.Event,
+    sync_config: SyncConfig | None,
 ) -> None:
     while not stop_event.is_set():
         try:
@@ -1110,6 +1843,13 @@ def collector_loop(
             stamp = local_now()
             append_sample_record(data_dir, rows, interval_seconds=interval_seconds, timestamp=stamp)
             state.record_sample(stamp, rows)
+            if sync_config and sync_config.enabled:
+                try:
+                    synced_days = sync_completed_days(data_dir, sync_config)
+                    if synced_days:
+                        state.record_sync(synced_days)
+                except Exception as sync_exc:  # noqa: BLE001 - optional archive should not stop collection
+                    state.record_sync([], str(sync_exc))
         except Exception as exc:  # noqa: BLE001 - this is a resilient background collector
             message = str(exc)
             append_error_record(data_dir, message)
@@ -1117,9 +1857,23 @@ def collector_loop(
             stop_event.wait(min(interval_seconds, 30))
 
 
-def serve(bind: str, data_dir: Path, *, interval_seconds: int, nettop_path: str, collect: bool) -> None:
+def serve(
+    bind: str,
+    data_dir: Path,
+    *,
+    interval_seconds: int,
+    nettop_path: str,
+    collect: bool,
+    sync_config: SyncConfig | None = None,
+) -> None:
     init_database(data_dir)
     state = CollectorState()
+    if sync_config and sync_config.enabled:
+        try:
+            synced_days = sync_completed_days(data_dir, sync_config)
+            state.record_sync(synced_days)
+        except Exception as exc:  # noqa: BLE001 - the dashboard can still serve local data
+            state.record_sync([], str(exc))
     stop_event = threading.Event()
     collector: threading.Thread | None = None
     if collect:
@@ -1131,18 +1885,20 @@ def serve(bind: str, data_dir: Path, *, interval_seconds: int, nettop_path: str,
                 "interval_seconds": interval_seconds,
                 "nettop_path": nettop_path,
                 "stop_event": stop_event,
+                "sync_config": sync_config,
             },
             daemon=True,
         )
         collector.start()
 
     host, port = parse_bind(bind)
-    server = DashboardServer((host, port), data_dir, state)
+    server = DashboardServer((host, port), data_dir, state, sync_config)
     actual_host, actual_port = server.server_address[:2]
     print(f"Dashboard: http://{actual_host}:{actual_port}/", flush=True)
     print(f"Data dir:  {data_dir}", flush=True)
     print(f"Database:  {database_path(data_dir)}", flush=True)
     print(f"Collect:   {'on' if collect else 'off'} interval={interval_seconds}s", flush=True)
+    print(f"Sync:      {'on' if sync_config and sync_config.enabled else 'off'}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1152,6 +1908,29 @@ def serve(bind: str, data_dir: Path, *, interval_seconds: int, nettop_path: str,
         server.server_close()
         if collector:
             collector.join(timeout=2)
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_sync_config(args: argparse.Namespace) -> SyncConfig:
+    database_url = args.sync_db_url or os.environ.get(SYNC_DATABASE_URL_ENV)
+    psql_path = args.sync_psql or os.environ.get(SYNC_PSQL_ENV) or "psql"
+    keychain_service = args.sync_keychain_service or os.environ.get(SYNC_KEYCHAIN_SERVICE_ENV)
+    keychain_account = args.sync_keychain_account or os.environ.get(SYNC_KEYCHAIN_ACCOUNT_ENV)
+    prune_after_sync = not args.no_sync_prune and not env_flag("NETWORK_TRAFFIC_SYNC_NO_PRUNE")
+    keep_local_days = args.sync_keep_local_days
+    if keep_local_days is None:
+        keep_local_days = int(os.environ.get("NETWORK_TRAFFIC_SYNC_KEEP_LOCAL_DAYS", "0") or 0)
+    return SyncConfig(
+        database_url=database_url,
+        psql_path=psql_path,
+        keychain_service=keychain_service,
+        keychain_account=keychain_account,
+        prune_after_sync=prune_after_sync,
+        keep_local_days=max(0, int(keep_local_days)),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1166,38 +1945,66 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", nargs="?", const=day_string(), metavar="YYYY-MM-DD", help="print a CLI report for a day")
     parser.add_argument("--days", action="store_true", help="list days stored in the database")
     parser.add_argument("--top", type=int, default=20, help="number of rows in CLI reports")
+    parser.add_argument("--sync-db-url", help=f"optional PostgreSQL archive URL; also reads ${SYNC_DATABASE_URL_ENV}")
+    parser.add_argument("--sync-psql", help=f"path to psql for optional sync; also reads ${SYNC_PSQL_ENV}")
+    parser.add_argument("--sync-keychain-service", help=f"macOS Keychain service for archive DB password; also reads ${SYNC_KEYCHAIN_SERVICE_ENV}")
+    parser.add_argument("--sync-keychain-account", help=f"macOS Keychain account for archive DB password; also reads ${SYNC_KEYCHAIN_ACCOUNT_ENV}")
+    parser.add_argument("--sync-keep-local-days", type=int, help="completed local days to keep after sync; default 0")
+    parser.add_argument("--no-sync-prune", action="store_true", help="sync completed days but keep them in the local SQLite database")
+    parser.add_argument("--sync-completed-days", action="store_true", help="sync and prune completed local days, then exit")
     args = parser.parse_args(argv)
+    sync_config = build_sync_config(args)
 
     if args.interval < 1:
         parser.error("--interval must be >= 1")
+    if args.sync_completed_days and not sync_config.enabled:
+        parser.error("--sync-completed-days requires --sync-db-url or NETWORK_TRAFFIC_SYNC_DATABASE_URL")
 
     if args.init_db:
         path = init_database(args.data_dir)
         print(f"Initialized database: {path}")
         return 0
 
+    if args.sync_completed_days:
+        synced_days = sync_completed_days(args.data_dir, sync_config)
+        if synced_days:
+            print("Synced completed days: " + ", ".join(synced_days))
+        else:
+            print("No completed local days needed sync.")
+        return 0
+
     if args.collect_once:
         rows = collect_once(args.interval, nettop_path=args.nettop)
         path = append_sample_record(args.data_dir, rows, interval_seconds=args.interval)
+        if sync_config.enabled:
+            sync_completed_days(args.data_dir, sync_config)
         print(f"Wrote {len(rows)} process rows to {path}")
-        print_report(summarize_day(args.data_dir), top=args.top)
+        print_report(summarize_day(args.data_dir, sync_config=sync_config), top=args.top)
         return 0
 
     if args.days:
-        for day in list_days(args.data_dir):
+        for day in list_days(args.data_dir, sync_config=sync_config):
             print(
                 f"{day['date']}  app_total={human_bytes(day['total_bytes'])}  "
                 f"tunnel_excluded={human_bytes(day.get('tunnel_total_bytes', 0))}  "
-                f"samples={day['sample_count']}  errors={day['error_count']}  {day['database_path']}"
+                f"samples={day['sample_count']}  errors={day['error_count']}  "
+                f"storage={day.get('storage', 'local')}  {day['database_path']}"
             )
         return 0
 
     if args.report:
-        print_report(summarize_day(args.data_dir, args.report), top=args.top)
+        print_report(summarize_day(args.data_dir, args.report, sync_config=sync_config), top=args.top)
         return 0
 
     if args.serve:
-        serve(args.serve, args.data_dir, interval_seconds=args.interval, nettop_path=args.nettop, collect=not args.no_collect)
+        serve(
+            args.serve,
+            args.data_dir,
+            interval_seconds=args.interval,
+            nettop_path=args.nettop,
+            collect=not args.no_collect,
+            sync_config=sync_config,
+        )
         return 0
 
     parser.print_help()
