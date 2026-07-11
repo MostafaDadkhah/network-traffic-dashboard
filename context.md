@@ -122,3 +122,15 @@ Reason: Rotated date labels can overlap bars and make the dashboard harder to sc
 Decision: Add zero-dependency canvas hover tooltips for dashboard charts. Hovering a daily, hourly, or top-process bar shows total, download, and upload values for that bar.
 
 Reason: The dashboard should expose exact values without forcing the user to read only approximate bar heights or switch to the table/CSV.
+
+### 2026-07-10 - Bounded PID samples and quieter polling
+
+Decision: Summary APIs and the dashboard table return `pid_count` plus a small recent PID sample instead of unbounded distinct PID lists. The dashboard requests only the top process rows, polls summaries less aggressively, and access logging is opt-in via `NETWORK_TRAFFIC_ACCESS_LOG=1`.
+
+Reason: Long-running collectors accumulate thousands of PIDs for respawning processes such as `adb`, `node`, `psql`, browser helpers, and Python workers. Returning every PID bloats JSON responses, breaks the table layout, makes public screenshots messy, and fills LaunchAgent logs with low-value polling noise.
+
+### 2026-07-10 - Date validation and explicit CSV tunnel export
+
+Decision: HTTP date query parameters must use `YYYY-MM-DD` and invalid values return HTTP 400. CSV export remains app-attributed by default, with `include_tunnels=1` for separate tunnel aggregate rows.
+
+Reason: Invalid dates should not look like empty valid days, and CSV output should make the app-vs-tunnel distinction explicit instead of carrying an always-false tunnel flag in the default export.

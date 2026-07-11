@@ -28,6 +28,10 @@ from typing import Any, Iterable, Sequence, cast
 APP_NAME = "NetworkTrafficDashboard"
 DEFAULT_BIND = "127.0.0.1:18686"
 DEFAULT_INTERVAL_SECONDS = 60
+DEFAULT_API_PROCESS_LIMIT = 40
+MAX_API_PROCESS_LIMIT = 200
+DEFAULT_PID_SAMPLE_LIMIT = 8
+MAX_PID_SAMPLE_LIMIT = 50
 SCHEMA_VERSION = 2
 DATABASE_FILENAME = "network_traffic.sqlite3"
 SYNC_DATABASE_URL_ENV = "NETWORK_TRAFFIC_SYNC_DATABASE_URL"
@@ -773,12 +777,16 @@ def append_error_record(data_dir: Path, error: str, *, timestamp: datetime | Non
 def parse_pids(value: str | None) -> list[int]:
     if not value:
         return []
-    pids: set[int] = set()
+    pids: list[int] = []
+    seen: set[int] = set()
     for part in value.split(","):
         part = part.strip()
         if part.isdigit():
-            pids.add(int(part))
-    return sorted(pids)
+            pid = int(part)
+            if pid not in seen:
+                seen.add(pid)
+                pids.append(pid)
+    return pids
 
 
 def empty_summary(data_dir: Path, date: str) -> dict[str, Any]:
@@ -808,7 +816,7 @@ def empty_summary(data_dir: Path, date: str) -> dict[str, Any]:
     }
 
 
-def normalize_process_rows(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+def normalize_process_rows(rows: Iterable[Any]) -> list[dict[str, Any]]:
     normalized = [dict(row) for row in rows]
     for row in normalized:
         row["bytes_in"] = int(row.get("bytes_in") or 0)
@@ -816,6 +824,23 @@ def normalize_process_rows(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
         row["total_bytes"] = int(row.get("total_bytes") or 0)
         row["samples"] = int(row.get("samples") or 0)
         row["pids"] = parse_pids(row.get("pids"))
+        row["pid_count"] = int(row.get("pid_count") or len(row["pids"]))
+        row["pids_truncated"] = row["pid_count"] > len(row["pids"])
+        row["is_tunnel"] = bool(row.get("is_tunnel"))
+    return normalized
+
+
+def normalize_latest_process_rows(rows: Iterable[Any]) -> list[dict[str, Any]]:
+    normalized = [dict(row) for row in rows]
+    for row in normalized:
+        row["bytes_in"] = int(row.get("bytes_in") or 0)
+        row["bytes_out"] = int(row.get("bytes_out") or 0)
+        row["total_bytes"] = int(row.get("total_bytes") or 0)
+        row["pid"] = int(row["pid"]) if row.get("pid") is not None else None
+        row["pids"] = [row["pid"]] if row["pid"] is not None else []
+        row["pid_count"] = len(row["pids"])
+        row["pids_truncated"] = False
+        row["samples"] = 1
         row["is_tunnel"] = bool(row.get("is_tunnel"))
     return normalized
 
@@ -829,12 +854,17 @@ def summarize_day(
     date: str | None = None,
     *,
     top_limit: int | None = None,
+    pid_limit: int = DEFAULT_PID_SAMPLE_LIMIT,
     sync_config: SyncConfig | None = None,
 ) -> dict[str, Any]:
     selected_date = date or day_string()
+    pid_limit = min(max(int(pid_limit), 0), MAX_PID_SAMPLE_LIMIT)
+    if top_limit is not None:
+        top_limit = min(max(int(top_limit), 1), MAX_API_PROCESS_LIMIT)
     if should_read_remote(sync_config, selected_date):
         try:
-            return summarize_day_remote(sync_config, data_dir, selected_date, top_limit=top_limit)
+            assert sync_config is not None
+            return summarize_day_remote(sync_config, data_dir, selected_date, top_limit=top_limit, pid_limit=pid_limit)
         except Exception:
             # If the optional archive is unavailable, keep the dashboard usable.
             # A pruned local day may still return an empty local summary.
@@ -884,26 +914,51 @@ def summarize_day(
             return summary
 
         process_select = """
-            SELECT d.process AS process,
-                   COALESCE(SUM(d.bytes_in), 0) AS bytes_in,
-                   COALESCE(SUM(d.bytes_out), 0) AS bytes_out,
-                   COALESCE(SUM(d.total_bytes), 0) AS total_bytes,
-                   COUNT(*) AS samples,
-                   MAX(d.is_tunnel) AS is_tunnel,
-                   GROUP_CONCAT(DISTINCT d.pid) AS pids
-            FROM process_deltas d
-            JOIN samples s ON s.id = d.sample_id
-            WHERE s.date = ? AND d.is_tunnel = ?
-            GROUP BY d.process
-            ORDER BY total_bytes DESC
+            SELECT agg.process,
+                   agg.bytes_in,
+                   agg.bytes_out,
+                   agg.total_bytes,
+                   agg.samples,
+                   agg.is_tunnel,
+                   agg.pid_count,
+                   (
+                       SELECT GROUP_CONCAT(pid)
+                       FROM (
+                           SELECT d2.pid AS pid, MAX(d2.id) AS last_seen_id
+                           FROM process_deltas d2
+                           JOIN samples s2 ON s2.id = d2.sample_id
+                           WHERE s2.date = agg.date
+                             AND d2.is_tunnel = agg.is_tunnel
+                             AND d2.process = agg.process
+                             AND d2.pid IS NOT NULL
+                           GROUP BY d2.pid
+                           ORDER BY last_seen_id DESC
+                           LIMIT ?
+                       )
+                   ) AS pids
+            FROM (
+                SELECT s.date AS date,
+                       d.process AS process,
+                       COALESCE(SUM(d.bytes_in), 0) AS bytes_in,
+                       COALESCE(SUM(d.bytes_out), 0) AS bytes_out,
+                       COALESCE(SUM(d.total_bytes), 0) AS total_bytes,
+                       COUNT(*) AS samples,
+                       MAX(d.is_tunnel) AS is_tunnel,
+                       COUNT(DISTINCT d.pid) AS pid_count
+                FROM process_deltas d
+                JOIN samples s ON s.id = d.sample_id
+                WHERE s.date = ? AND d.is_tunnel = ?
+                GROUP BY s.date, d.process
+            ) agg
+            ORDER BY agg.total_bytes DESC
         """
         process_query = process_select
-        params: list[Any] = [selected_date, 0]
+        params: list[Any] = [pid_limit, selected_date, 0]
         if top_limit is not None:
             process_query += " LIMIT ?"
             params.append(top_limit)
         process_rows = normalize_process_rows(conn.execute(process_query, params))
-        tunnel_rows = normalize_process_rows(conn.execute(process_select, (selected_date, 1)))
+        tunnel_rows = normalize_process_rows(conn.execute(process_select, (pid_limit, selected_date, 1)))
 
         latest_sample = conn.execute(
             "SELECT id FROM samples WHERE date = ? ORDER BY ts DESC, id DESC LIMIT 1",
@@ -912,7 +967,7 @@ def summarize_day(
         latest_rows: list[dict[str, Any]] = []
         latest_tunnel_rows: list[dict[str, Any]] = []
         if latest_sample:
-            latest_rows = normalize_process_rows(
+            latest_rows = normalize_latest_process_rows(
                 conn.execute(
                     """
                     SELECT raw_process, process, pid, bytes_in, bytes_out, total_bytes, is_tunnel
@@ -924,7 +979,7 @@ def summarize_day(
                     (latest_sample["id"],),
                 )
             )
-            latest_tunnel_rows = normalize_process_rows(
+            latest_tunnel_rows = normalize_latest_process_rows(
                 conn.execute(
                     """
                     SELECT raw_process, process, pid, bytes_in, bytes_out, total_bytes, is_tunnel
@@ -969,7 +1024,11 @@ def summarize_day_remote(
     date: str,
     *,
     top_limit: int | None = None,
+    pid_limit: int = DEFAULT_PID_SAMPLE_LIMIT,
 ) -> dict[str, Any]:
+    pid_limit = min(max(int(pid_limit), 0), MAX_PID_SAMPLE_LIMIT)
+    if top_limit is not None:
+        top_limit = min(max(int(top_limit), 1), MAX_API_PROCESS_LIMIT)
     ensure_remote_schema(sync_config)
     selected_date = sql_literal(date)
     sample_stats = psql_json_one(
@@ -1018,19 +1077,46 @@ def summarize_day_remote(
     )
 
     limit_sql = f" LIMIT {int(top_limit)}" if top_limit is not None else ""
+    pid_limit_sql = max(0, int(pid_limit))
     process_select = f"""
-        SELECT d.process AS process,
-               COALESCE(SUM(d.bytes_in), 0)::bigint AS bytes_in,
-               COALESCE(SUM(d.bytes_out), 0)::bigint AS bytes_out,
-               COALESCE(SUM(d.total_bytes), 0)::bigint AS total_bytes,
-               COUNT(*)::bigint AS samples,
-               MAX(d.is_tunnel)::integer AS is_tunnel,
-               STRING_AGG(DISTINCT d.pid::text, ',') FILTER (WHERE d.pid IS NOT NULL) AS pids
-        FROM process_deltas d
-        JOIN samples s ON s.id = d.sample_id
-        WHERE s.date = {selected_date} AND d.is_tunnel = {{is_tunnel}}
-        GROUP BY d.process
-        ORDER BY total_bytes DESC
+        SELECT agg.process,
+               agg.bytes_in,
+               agg.bytes_out,
+               agg.total_bytes,
+               agg.samples,
+               agg.is_tunnel,
+               agg.pid_count,
+               limited_pids.pids
+        FROM (
+            SELECT s.date AS date,
+                   d.process AS process,
+                   COALESCE(SUM(d.bytes_in), 0)::bigint AS bytes_in,
+                   COALESCE(SUM(d.bytes_out), 0)::bigint AS bytes_out,
+                   COALESCE(SUM(d.total_bytes), 0)::bigint AS total_bytes,
+                   COUNT(*)::bigint AS samples,
+                   MAX(d.is_tunnel)::integer AS is_tunnel,
+                   COUNT(DISTINCT d.pid)::bigint AS pid_count
+            FROM process_deltas d
+            JOIN samples s ON s.id = d.sample_id
+            WHERE s.date = {selected_date} AND d.is_tunnel = {{is_tunnel}}
+            GROUP BY s.date, d.process
+        ) agg
+        LEFT JOIN LATERAL (
+            SELECT STRING_AGG(pid_text, ',') AS pids
+            FROM (
+                SELECT d2.pid::text AS pid_text, MAX(d2.id) AS last_seen_id
+                FROM process_deltas d2
+                JOIN samples s2 ON s2.id = d2.sample_id
+                WHERE s2.date = agg.date
+                  AND d2.is_tunnel = agg.is_tunnel
+                  AND d2.process = agg.process
+                  AND d2.pid IS NOT NULL
+                GROUP BY d2.pid
+                ORDER BY last_seen_id DESC
+                LIMIT {pid_limit_sql}
+            ) p
+        ) limited_pids ON TRUE
+        ORDER BY agg.total_bytes DESC
     """
     process_rows = normalize_process_rows(psql_json_rows(sync_config, process_select.format(is_tunnel=0) + limit_sql))
     tunnel_rows = normalize_process_rows(psql_json_rows(sync_config, process_select.format(is_tunnel=1)))
@@ -1050,8 +1136,8 @@ def summarize_day_remote(
             ORDER BY total_bytes DESC
             LIMIT 20
         """
-        latest_rows = normalize_process_rows(psql_json_rows(sync_config, latest_query.format(is_tunnel=0)))
-        latest_tunnel_rows = normalize_process_rows(psql_json_rows(sync_config, latest_query.format(is_tunnel=1)))
+        latest_rows = normalize_latest_process_rows(psql_json_rows(sync_config, latest_query.format(is_tunnel=0)))
+        latest_tunnel_rows = normalize_latest_process_rows(psql_json_rows(sync_config, latest_query.format(is_tunnel=1)))
 
     return {
         "date": date,
@@ -1390,6 +1476,7 @@ DASHBOARD_HTML = """<!doctype html>
     th, td { padding: 11px 12px; border-bottom: 1px solid #202a42; text-align: left; }
     th { background: #151f38; color: #aebddb; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
     tr:last-child td { border-bottom: none; }
+    .pids { max-width: 210px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #b7c4df; }
     .bar { height: 7px; background: #24304c; border-radius: 999px; overflow: hidden; min-width: 90px; }
     .bar span { display: block; height: 100%; background: linear-gradient(90deg, #38bdf8, #22c55e); }
     .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #334155; color: #dbeafe; margin-left: 6px; }
@@ -1425,7 +1512,7 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="chart-card"><h2 class="chart-title">Top app processes before tunnel</h2><canvas id="processChart"></canvas></div>
     </section>
     <table>
-      <thead><tr><th>App process</th><th>Total</th><th>Download</th><th>Upload</th><th>Share</th><th>PIDs</th></tr></thead>
+      <thead><tr><th>App process</th><th>Total</th><th>Download</th><th>Upload</th><th>Share</th><th>PID sample</th></tr></thead>
       <tbody id="rows"><tr><td colspan="6">Loading...</td></tr></tbody>
     </table>
     <footer id="footer"></footer>
@@ -1445,6 +1532,25 @@ const formatDateLabel = (value) => {
   return parts.length === 3 ? `${parts[1]}/${parts[2]}` : String(value || '').slice(0, 8);
 };
 const escapeHtml = (s) => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const DASHBOARD_TOP_LIMIT = 40;
+const PID_SAMPLE_LIMIT = 8;
+const SUMMARY_REFRESH_MS = 30000;
+const DAYS_REFRESH_MS = 120000;
+async function fetchJson(url) {
+  const response = await fetch(url);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+  return payload;
+}
+function formatPids(row) {
+  const pids = row.pids || [];
+  const pidCount = Number(row.pid_count || pids.length || 0);
+  if (!pidCount) return '';
+  const shown = pids.join(', ');
+  const more = pidCount - pids.length;
+  if (more > 0) return `${shown}${shown ? ' ' : ''}+${more} more`;
+  return shown;
+}
 const chartTooltip = document.getElementById('chartTooltip');
 function tooltipHtml(item, title) {
   return `<div class="tooltip-title">${escapeHtml(title)}</div>` +
@@ -1546,6 +1652,7 @@ function drawBars(canvas, items, options = {}) {
   }
   const gap = Math.max(2, Math.min(8, chartW / Math.max(items.length * 8, 1)));
   const barW = Math.max(2, (chartW - gap * (items.length - 1)) / items.length);
+  let lastLabelIndex = -labelEvery;
   items.forEach((item, idx) => {
     const value = Number(item[valueKey] || 0);
     const barH = (value / max) * chartH;
@@ -1555,7 +1662,8 @@ function drawBars(canvas, items, options = {}) {
     ctx.fillStyle = color;
     ctx.fillRect(x, y, barW, barH);
     hitRegions.push({ x, y, width: barW, height: Math.max(3, barH), item, label });
-    if (idx % labelEvery === 0 || idx === items.length - 1) {
+    if (idx % labelEvery === 0 || (idx === items.length - 1 && idx - lastLabelIndex >= labelEvery)) {
+      lastLabelIndex = idx;
       ctx.fillStyle = '#9fb0d0';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
@@ -1570,6 +1678,8 @@ function drawBars(canvas, items, options = {}) {
 }
 let recordedDays = [];
 let recordedDateValues = [];
+let collectorState = {};
+let syncState = {};
 const datePicker = document.getElementById('datePicker');
 const previousDayBtn = document.getElementById('previousDayBtn');
 const nextDayBtn = document.getElementById('nextDayBtn');
@@ -1613,9 +1723,11 @@ function moveRecordedDay(delta) {
   loadSummary().catch(err => { document.getElementById('status').textContent = err; });
 }
 async function loadDays() {
-  const days = await fetch('/api/days').then(r => r.json());
+  const days = await fetchJson('/api/days');
   const previous = datePicker.value;
   recordedDays = days.days || [];
+  collectorState = days.collector || {};
+  syncState = days.sync || {};
   recordedDateValues = recordedDays.map(day => day.date).sort();
   if (!recordedDateValues.length) {
     datePicker.value = '';
@@ -1635,9 +1747,10 @@ async function loadDays() {
 }
 async function loadSummary() {
   const date = datePicker.value;
-  const url = date ? `/api/day?date=${encodeURIComponent(date)}` : '/api/today';
-  const data = await fetch(url).then(r => r.json());
-  const series = await fetch(`/api/timeseries?date=${encodeURIComponent(data.date)}`).then(r => r.json());
+  const params = `top=${DASHBOARD_TOP_LIMIT}&pids=${PID_SAMPLE_LIMIT}`;
+  const url = date ? `/api/day?date=${encodeURIComponent(date)}&${params}` : `/api/today?${params}`;
+  const data = await fetchJson(url);
+  const series = await fetchJson(`/api/timeseries?date=${encodeURIComponent(data.date)}`);
   if (!datePicker.value && data.date) datePicker.value = data.date;
   updateDateNavButtons();
   document.getElementById('total').textContent = fmtBytes(data.total_bytes);
@@ -1656,12 +1769,16 @@ async function loadSummary() {
   for (const row of rows) {
     const tr = document.createElement('tr');
     const share = Math.round((row.total_bytes / max) * 100);
-    tr.innerHTML = `<td>${escapeHtml(row.process)}</td><td>${fmtBytes(row.total_bytes)}</td><td>${fmtBytes(row.bytes_in)}</td><td>${fmtBytes(row.bytes_out)}</td><td><div class="bar"><span style="width:${share}%"></span></div></td><td>${escapeHtml((row.pids || []).join(', '))}</td>`;
+    const pidText = formatPids(row);
+    const pidTitle = row.pid_count ? `${row.pid_count} distinct PID${row.pid_count === 1 ? '' : 's'}` : '';
+    tr.innerHTML = `<td>${escapeHtml(row.process)}</td><td>${fmtBytes(row.total_bytes)}</td><td>${fmtBytes(row.bytes_in)}</td><td>${fmtBytes(row.bytes_out)}</td><td><div class="bar"><span style="width:${share}%"></span></div></td><td class="pids" title="${escapeHtml(pidTitle)}">${escapeHtml(pidText)}</td>`;
     tbody.appendChild(tr);
   }
   if (!rows.length) tbody.innerHTML = '<tr><td colspan="6">No data has been recorded yet.</td></tr>';
   const err = data.last_error ? ` <span class="error">Last error: ${escapeHtml(data.last_error)}</span>` : '';
-  document.getElementById('footer').innerHTML = `Database: ${escapeHtml(data.database_path)}. App totals exclude tunnel transport aggregate (${fmtBytes(data.tunnel_total_bytes)}). Observed raw total including tunnel: ${fmtBytes(data.observed_total_bytes)}.${err}`;
+  const syncErr = collectorState.last_sync_error ? ` <span class="error">Sync error: ${escapeHtml(collectorState.last_sync_error)}</span>` : '';
+  const syncLabel = syncState.enabled ? ' Sync: enabled.' : '';
+  document.getElementById('footer').innerHTML = `Database: ${escapeHtml(data.database_path)}. App totals exclude tunnel transport aggregate (${fmtBytes(data.tunnel_total_bytes)}). Observed raw total including tunnel: ${fmtBytes(data.observed_total_bytes)}.${syncLabel}${err}${syncErr}`;
 }
 async function refreshAll() { await loadDays(); await loadSummary(); }
 document.getElementById('refreshBtn').addEventListener('click', refreshAll);
@@ -1676,8 +1793,8 @@ latestDayBtn.addEventListener('click', () => {
 });
 window.addEventListener('resize', () => { loadSummary().catch(() => {}); });
 refreshAll().catch(err => { document.getElementById('status').textContent = err; });
-setInterval(() => { loadSummary().catch(() => {}); }, 5000);
-setInterval(() => { loadDays().catch(() => {}); }, 60000);
+setInterval(() => { loadSummary().catch(() => {}); }, SUMMARY_REFRESH_MS);
+setInterval(() => { loadDays().catch(() => {}); }, DAYS_REFRESH_MS);
 </script>
 </body>
 </html>
@@ -1704,6 +1821,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         return cast(DashboardServer, self.server)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003 - inherited API name
+        if os.environ.get("NETWORK_TRAFFIC_ACCESS_LOG", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), format % args))
 
     def send_bytes(self, body: bytes, *, content_type: str, status: int = 200) -> None:
@@ -1721,9 +1840,18 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             status=status,
         )
 
+    def date_from_query(self, query: dict[str, list[str]]) -> str | None:
+        date = first_query_value(query, "date") or day_string()
+        if not is_valid_date_string(date):
+            self.send_json({"error": "date must use YYYY-MM-DD"}, status=400)
+            return None
+        return date
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
+        top_limit = bounded_query_int(query, "top", DEFAULT_API_PROCESS_LIMIT, MAX_API_PROCESS_LIMIT, minimum=1)
+        pid_limit = bounded_query_int(query, "pids", DEFAULT_PID_SAMPLE_LIMIT, MAX_PID_SAMPLE_LIMIT, minimum=0)
         if parsed.path == "/":
             self.send_bytes(DASHBOARD_HTML.encode("utf-8"), content_type="text/html; charset=utf-8")
             return
@@ -1742,11 +1870,28 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_json(payload)
             return
         if parsed.path == "/api/today":
-            self.send_json(summarize_day(self.dashboard_server.data_dir, sync_config=self.dashboard_server.sync_config))
+            self.send_json(
+                summarize_day(
+                    self.dashboard_server.data_dir,
+                    top_limit=top_limit,
+                    pid_limit=pid_limit,
+                    sync_config=self.dashboard_server.sync_config,
+                )
+            )
             return
         if parsed.path == "/api/day":
-            date = first_query_value(query, "date") or day_string()
-            self.send_json(summarize_day(self.dashboard_server.data_dir, date, sync_config=self.dashboard_server.sync_config))
+            date = self.date_from_query(query)
+            if date is None:
+                return
+            self.send_json(
+                summarize_day(
+                    self.dashboard_server.data_dir,
+                    date,
+                    top_limit=top_limit,
+                    pid_limit=pid_limit,
+                    sync_config=self.dashboard_server.sync_config,
+                )
+            )
             return
         if parsed.path == "/api/days":
             self.send_json(
@@ -1758,7 +1903,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/api/timeseries":
-            date = first_query_value(query, "date") or day_string()
+            date = self.date_from_query(query)
+            if date is None:
+                return
             self.send_json(
                 {
                     "date": date,
@@ -1771,9 +1918,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/api/export.csv":
-            date = first_query_value(query, "date") or day_string()
+            date = self.date_from_query(query)
+            if date is None:
+                return
             self.send_bytes(
-                export_csv(self.dashboard_server.data_dir, date, sync_config=self.dashboard_server.sync_config),
+                export_csv(
+                    self.dashboard_server.data_dir,
+                    date,
+                    include_tunnels=query_flag(query, "include_tunnels"),
+                    pid_limit=pid_limit,
+                    sync_config=self.dashboard_server.sync_config,
+                ),
                 content_type="text/csv; charset=utf-8",
             )
             return
@@ -1783,6 +1938,37 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 def first_query_value(query: dict[str, list[str]], name: str) -> str | None:
     values = query.get(name) or []
     return values[0] if values else None
+
+
+def is_valid_date_string(value: str) -> bool:
+    try:
+        parse_date(value)
+    except ValueError:
+        return False
+    return True
+
+
+def bounded_query_int(
+    query: dict[str, list[str]],
+    name: str,
+    default: int,
+    maximum: int,
+    *,
+    minimum: int = 0,
+) -> int:
+    value = first_query_value(query, name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return min(max(parsed, minimum), maximum)
+
+
+def query_flag(query: dict[str, list[str]], name: str) -> bool:
+    value = first_query_value(query, name)
+    return bool(value and value.strip().lower() in {"1", "true", "yes", "on"})
 
 
 def sync_status(sync_config: SyncConfig | None) -> dict[str, Any]:
@@ -1799,22 +1985,43 @@ def sync_status(sync_config: SyncConfig | None) -> dict[str, Any]:
     }
 
 
-def export_csv(data_dir: Path, date: str, *, sync_config: SyncConfig | None = None) -> bytes:
-    summary = summarize_day(data_dir, date, sync_config=sync_config)
+def export_csv(
+    data_dir: Path,
+    date: str,
+    *,
+    include_tunnels: bool = False,
+    pid_limit: int = DEFAULT_PID_SAMPLE_LIMIT,
+    sync_config: SyncConfig | None = None,
+) -> bytes:
+    summary = summarize_day(data_dir, date, pid_limit=pid_limit, sync_config=sync_config)
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["date", "process", "bytes_in", "bytes_out", "total_bytes", "samples", "pids", "is_tunnel"])
-    for row in summary["processes"]:
+    writer.writerow([
+        "date",
+        "traffic_class",
+        "process",
+        "bytes_in",
+        "bytes_out",
+        "total_bytes",
+        "samples",
+        "pid_count",
+        "pids_sample",
+    ])
+    rows: list[tuple[str, dict[str, Any]]] = [("app", row) for row in summary["processes"]]
+    if include_tunnels:
+        rows.extend(("tunnel", row) for row in summary["tunnel_processes"])
+    for traffic_class, row in rows:
         writer.writerow(
             [
                 summary["date"],
+                traffic_class,
                 row["process"],
                 row["bytes_in"],
                 row["bytes_out"],
                 row["total_bytes"],
                 row["samples"],
+                row.get("pid_count", len(row.get("pids", []))),
                 " ".join(str(pid) for pid in row.get("pids", [])),
-                "yes" if row.get("is_tunnel") else "no",
             ]
         )
     return buffer.getvalue().encode("utf-8")

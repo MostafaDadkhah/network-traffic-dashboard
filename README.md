@@ -16,6 +16,7 @@ The collector samples Apple's `nettop`, stores every sample in SQLite, and serve
 - Hourly app-attributed chart for the selected day.
 - Top app-process chart and table for the selected day.
 - Hover tooltips on charts showing total, download, and upload values.
+- Compact PID samples: APIs and the table return `pid_count` plus a short recent PID sample instead of unbounded PID lists.
 - Calendar-style date picker with previous/next/latest recorded-day navigation.
 - High-contrast SVG favicon for quickly spotting the dashboard tab.
 - Separate tunnel aggregate card for `MacPacketTunnel` / `Shadowrocket` transport volume.
@@ -100,6 +101,9 @@ NETWORK_TRAFFIC_SYNC_KEYCHAIN_ACCOUNT=user \
 python3 network_usage_dashboard.py --serve 127.0.0.1:18686 --interval 60
 ```
 
+Prefer a passwordless PostgreSQL URL plus macOS Keychain variables. Do not put a
+database password in LaunchAgent arguments or committed documentation.
+
 Sync completed local days once and exit:
 
 ```bash
@@ -178,14 +182,26 @@ CSV export is available from the dashboard:
 /api/export.csv?date=YYYY-MM-DD
 ```
 
+By default CSV exports app-attributed rows only. Add `include_tunnels=1` when you
+also need the separate tunnel aggregate rows:
+
+```text
+/api/export.csv?date=YYYY-MM-DD&include_tunnels=1
+```
+
 ## Local API
 
 - `GET /health`
-- `GET /api/today`
-- `GET /api/day?date=YYYY-MM-DD`
+- `GET /api/today?top=40&pids=8`
+- `GET /api/day?date=YYYY-MM-DD&top=40&pids=8`
 - `GET /api/days`
 - `GET /api/timeseries?date=YYYY-MM-DD`
-- `GET /api/export.csv?date=YYYY-MM-DD`
+- `GET /api/export.csv?date=YYYY-MM-DD&include_tunnels=1&pids=8`
+
+`top` caps process rows returned by summary APIs and `pids` caps the recent PID
+sample per process. Every process row still includes `pid_count` so long-running
+respawning processes remain visible without bloating the UI or JSON payload.
+Invalid `date` values return HTTP 400.
 
 When archive sync is configured, these APIs automatically read current-day data
 from SQLite and completed-day data from PostgreSQL.
@@ -202,3 +218,7 @@ python3 -m pytest -q
 ## Notes
 
 `MacPacketTunnel` and `Shadowrocket` rows are aggregate tunnel transport usage, not the real app ranking. The dashboard excludes those tunnel rows from main totals, charts, tables, and CLI reports by default, then shows the excluded tunnel volume separately. Other rows such as `Chrome`, `node`, `Python`, `Telegram`, or `Tailscale` identify processes macOS can still attribute before traffic enters the tunnel. Attribution is useful, but not perfect: traffic that macOS only exposes as packet-tunnel transport cannot be reassigned to an original app without deeper privileged packet/flow instrumentation.
+
+HTTP access logging is disabled by default to avoid noisy LaunchAgent logs during
+normal dashboard polling. Set `NETWORK_TRAFFIC_ACCESS_LOG=1` when request-level
+debugging is needed.

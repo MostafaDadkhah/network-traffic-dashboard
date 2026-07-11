@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import threading
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 import network_usage_dashboard as dashboard
@@ -52,9 +57,12 @@ def test_append_and_summarize_daily_database(tmp_path) -> None:
     assert summary["tunnel_total_bytes"] == tunnel_total
     assert summary["observed_total_bytes"] == app_total + tunnel_total
     assert summary["processes"][0]["process"] == "io.tailscale.ip"
+    assert summary["processes"][0]["pid_count"] == 1
+    assert not summary["processes"][0]["pids_truncated"]
     assert all(not row["is_tunnel"] for row in summary["processes"])
     assert summary["tunnel_processes"][0]["process"] == "MacPacketTunnel"
     assert summary["latest_processes"][0]["process"] == "io.tailscale.ip"
+    assert summary["latest_processes"][0]["samples"] == 1
     assert summary["latest_tunnel_processes"][0]["process"] == "MacPacketTunnel"
 
     days = dashboard.list_days(tmp_path)
@@ -105,8 +113,68 @@ def test_export_csv_contains_process_totals(tmp_path) -> None:
     csv_bytes = dashboard.export_csv(tmp_path, "2026-07-03")
     csv_text = csv_bytes.decode("utf-8")
 
-    assert "process,bytes_in,bytes_out,total_bytes" in csv_text
-    assert "node,110,90,200" in csv_text
+    assert "date,traffic_class,process,bytes_in,bytes_out,total_bytes,samples,pid_count,pids_sample" in csv_text
+    assert "2026-07-03,app,node,110,90,200,2,2," in csv_text
+
+
+def test_export_csv_can_include_tunnel_rows(tmp_path) -> None:
+    rows = [
+        dashboard.ProcessDelta("node.123", "node", 123, 100, 50),
+        dashboard.ProcessDelta("MacPacketTunnel.456", "MacPacketTunnel", 456, 10, 40),
+    ]
+    timestamp = datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc)
+    dashboard.append_sample_record(tmp_path, rows, interval_seconds=1, timestamp=timestamp)
+
+    default_csv = dashboard.export_csv(tmp_path, "2026-07-03").decode("utf-8")
+    tunnel_csv = dashboard.export_csv(tmp_path, "2026-07-03", include_tunnels=True).decode("utf-8")
+
+    assert "MacPacketTunnel" not in default_csv
+    assert "2026-07-03,tunnel,MacPacketTunnel,10,40,50,1,1,456" in tunnel_csv
+
+
+def test_summary_caps_pid_lists_but_reports_pid_count(tmp_path) -> None:
+    timestamp = datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc)
+    for offset in range(12):
+        dashboard.append_sample_record(
+            tmp_path,
+            [dashboard.ProcessDelta(f"node.{100 + offset}", "node", 100 + offset, 1, 1)],
+            interval_seconds=1,
+            timestamp=timestamp,
+        )
+
+    summary = dashboard.summarize_day(tmp_path, "2026-07-03", pid_limit=3)
+    row = summary["processes"][0]
+
+    assert row["pid_count"] == 12
+    assert row["pids_truncated"] is True
+    assert row["pids"] == [111, 110, 109]
+
+
+def test_http_invalid_date_returns_400_and_access_log_is_silent_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("NETWORK_TRAFFIC_ACCESS_LOG", raising=False)
+    dashboard.init_database(tmp_path)
+    state = dashboard.CollectorState()
+    server = dashboard.DashboardServer(("127.0.0.1", 0), tmp_path, state, None)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    stderr = io.StringIO()
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/api/day?date=not-a-date"
+
+    try:
+        with contextlib.redirect_stderr(stderr):
+            try:
+                urllib.request.urlopen(url, timeout=5)
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+                assert b"date must use YYYY-MM-DD" in exc.read()
+            else:  # pragma: no cover - defensive assertion clarity
+                raise AssertionError("invalid date request unexpectedly succeeded")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert stderr.getvalue() == ""
 
 
 def test_completed_local_days_respects_today_and_keep_window(tmp_path) -> None:
@@ -183,7 +251,12 @@ def test_dashboard_html_is_english() -> None:
     assert "Latest day" in dashboard.DASHBOARD_HTML
     assert "formatDateLabel" in dashboard.DASHBOARD_HTML
     assert "labelMinWidth" in dashboard.DASHBOARD_HTML
+    assert "lastLabelIndex" in dashboard.DASHBOARD_HTML
     assert "chartTooltip" in dashboard.DASHBOARD_HTML
+    assert "DASHBOARD_TOP_LIMIT" in dashboard.DASHBOARD_HTML
+    assert "PID_SAMPLE_LIMIT" in dashboard.DASHBOARD_HTML
+    assert "formatPids" in dashboard.DASHBOARD_HTML
+    assert "PID sample" in dashboard.DASHBOARD_HTML
     assert "tooltipHtml" in dashboard.DASHBOARD_HTML
     assert "Download" in dashboard.DASHBOARD_HTML
     assert "Upload" in dashboard.DASHBOARD_HTML
