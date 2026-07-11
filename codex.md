@@ -41,7 +41,17 @@ Tables:
 
 ## Collector behavior
 
-Use:
+Default low-CPU mode:
+
+```text
+nettop -P -x -L 1 -s 1 -n -J bytes_in,bytes_out
+```
+
+Run instant snapshots every `--snapshot-poll-interval` seconds, diff cumulative
+counters in Python, aggregate process deltas, and write one sample per
+`--interval`.
+
+Legacy high-fidelity mode remains available with `--collector-mode delta`:
 
 ```text
 nettop -P -x -d -L 2 -s <interval> -n
@@ -49,7 +59,8 @@ nettop -P -x -d -L 2 -s <interval> -n
 
 Rules:
 
-- Skip the first sample block because it may contain cumulative counters.
+- Keep `snapshot` as the default unless there is explicit evidence that the user needs continuous short-lived-process capture more than low CPU.
+- In delta mode, skip the first sample block because it may contain cumulative counters.
 - Parse process identity with `rpartition('.')` because names such as `io.tailscale.ip.79391` contain dots.
 - Tag `MacPacketTunnel`, `Shadowrocket`, and similar tunnel processes as aggregate tunnel rows.
 - Do not rank tunnel aggregates as app usage. Main totals, charts, and tables should use app-attributed non-tunnel rows by default and expose tunnel aggregate volume separately.

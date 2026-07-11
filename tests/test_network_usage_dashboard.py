@@ -22,6 +22,15 @@ time,,interface,state,bytes_in,bytes_out,rx_dupe,rx_ooo,re-tx,rtt_avg,rcvsize,tx
 20:48:17.212295,Code Helper (Pl.51458,,,0,702,0,0,0,,,,,,,,,,,,
 """
 
+NETTOP_COUNTER_CSV = """,bytes_in,bytes_out,
+node.123,100,50,
+Google Chrome H.456,0,20,
+"""
+
+NETTOP_FULL_COUNTER_CSV = """time,,interface,state,bytes_in,bytes_out,rx_dupe,rx_ooo,re-tx,rtt_avg,rcvsize,tx_win,tc_class,tc_mgt,cc_algo,P,C,R,W,arch,
+20:48:17.212278,node.123,,,100,50,0,0,0,,,,,,,,,,,,
+"""
+
 
 def test_parse_nettop_csv_skips_first_cumulative_sample() -> None:
     rows = dashboard.parse_nettop_csv(NETTOP_CSV)
@@ -38,6 +47,64 @@ def test_parse_nettop_csv_skips_first_cumulative_sample() -> None:
     assert rows[1].process == "MacPacketTunnel"
     assert rows[1].pid == 18262
     assert dashboard.is_tunnel_process(rows[1].process)
+
+
+def test_parse_nettop_counter_csv_accepts_compact_and_full_snapshot_shapes() -> None:
+    compact = dashboard.parse_nettop_counter_csv(NETTOP_COUNTER_CSV)
+    full = dashboard.parse_nettop_counter_csv(NETTOP_FULL_COUNTER_CSV)
+
+    assert compact["node.123"].process == "node"
+    assert compact["node.123"].pid == 123
+    assert compact["node.123"].bytes_in == 100
+    assert compact["Google Chrome H.456"].bytes_out == 20
+    assert full["node.123"].bytes_in == 100
+    assert full["node.123"].bytes_out == 50
+
+
+def test_diff_nettop_counters_clamps_resets_and_counts_new_processes() -> None:
+    previous = {
+        "node.123": dashboard.ProcessCounter("node.123", "node", 123, 100, 50),
+        "reset.456": dashboard.ProcessCounter("reset.456", "reset", 456, 1000, 900),
+    }
+    current = {
+        "node.123": dashboard.ProcessCounter("node.123", "node", 123, 175, 60),
+        "reset.456": dashboard.ProcessCounter("reset.456", "reset", 456, 10, 5),
+        "new.789": dashboard.ProcessCounter("new.789", "new", 789, 7, 3),
+    }
+
+    rows = {row.raw_process: row for row in dashboard.diff_nettop_counters(previous, current)}
+
+    assert rows["node.123"].bytes_in == 75
+    assert rows["node.123"].bytes_out == 10
+    assert "reset.456" not in rows
+    assert rows["new.789"].bytes_in == 7
+    assert rows["new.789"].bytes_out == 3
+
+
+def test_collect_once_snapshot_polls_instant_counters_without_continuous_nettop(monkeypatch) -> None:
+    snapshots = [
+        {"node.123": dashboard.ProcessCounter("node.123", "node", 123, 100, 50)},
+        {"node.123": dashboard.ProcessCounter("node.123", "node", 123, 150, 55)},
+        {"node.123": dashboard.ProcessCounter("node.123", "node", 123, 170, 65)},
+    ]
+    monotonic_now = [0.0]
+
+    def fake_read_nettop_counters(*, nettop_path: str = "nettop") -> dict[str, dashboard.ProcessCounter]:
+        return snapshots.pop(0)
+
+    def fake_sleep(seconds: float) -> None:
+        monotonic_now[0] += seconds
+
+    monkeypatch.setattr(dashboard, "read_nettop_counters", fake_read_nettop_counters)
+    monkeypatch.setattr(dashboard.time, "monotonic", lambda: monotonic_now[0])
+    monkeypatch.setattr(dashboard.time, "sleep", fake_sleep)
+
+    rows = dashboard.collect_once_snapshot(2, poll_interval_seconds=1)
+
+    assert len(rows) == 1
+    assert rows[0].raw_process == "node.123"
+    assert rows[0].bytes_in == 70
+    assert rows[0].bytes_out == 15
 
 
 def test_append_and_summarize_daily_database(tmp_path) -> None:

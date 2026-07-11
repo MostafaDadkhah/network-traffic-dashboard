@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -28,6 +29,8 @@ from typing import Any, Iterable, Sequence, cast
 APP_NAME = "NetworkTrafficDashboard"
 DEFAULT_BIND = "127.0.0.1:18686"
 DEFAULT_INTERVAL_SECONDS = 60
+DEFAULT_COLLECTOR_MODE = "snapshot"
+DEFAULT_SNAPSHOT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_API_PROCESS_LIMIT = 40
 MAX_API_PROCESS_LIMIT = 200
 DEFAULT_PID_SAMPLE_LIMIT = 8
@@ -65,6 +68,15 @@ class ProcessDelta:
         data["total_bytes"] = self.total_bytes
         data["is_tunnel"] = is_tunnel_process(self.process)
         return data
+
+
+@dataclass(frozen=True)
+class ProcessCounter:
+    raw_process: str
+    process: str
+    pid: int | None
+    bytes_in: int
+    bytes_out: int
 
 
 @dataclass(frozen=True)
@@ -210,7 +222,128 @@ def parse_nettop_csv(text: str, *, skip_first_sample: bool = True) -> list[Proce
     return rows
 
 
-def collect_once(interval_seconds: int, *, nettop_path: str = "nettop") -> list[ProcessDelta]:
+def parse_nettop_counter_csv(text: str) -> dict[str, ProcessCounter]:
+    """Parse one non-delta nettop CSV snapshot into cumulative counters.
+
+    The low-CPU collector polls instant snapshots and computes deltas in Python.
+    It uses `-J bytes_in,bytes_out` to keep nettop output small, but this parser
+    also accepts the full CSV shape produced without `-J` for compatibility.
+    """
+    counters: dict[str, ProcessCounter] = {}
+    reader = csv.reader(io.StringIO(text))
+    for row in reader:
+        if not row:
+            continue
+
+        raw_process: str
+        bytes_in: int
+        bytes_out: int
+        if row[0] == "time":
+            continue
+        if len(row) >= 3 and row[0] == "" and row[1] == "bytes_in" and row[2] == "bytes_out":
+            continue
+        if len(row) >= 6 and row[0] and row[1]:
+            raw_process = row[1].strip()
+            bytes_in = parse_int(row[4])
+            bytes_out = parse_int(row[5])
+        elif len(row) >= 3:
+            raw_process = row[0].strip()
+            bytes_in = parse_int(row[1])
+            bytes_out = parse_int(row[2])
+        else:
+            continue
+
+        if not raw_process:
+            continue
+        process, pid = parse_process_identity(raw_process)
+        counters[raw_process] = ProcessCounter(
+            raw_process=raw_process,
+            process=process,
+            pid=pid,
+            bytes_in=bytes_in,
+            bytes_out=bytes_out,
+        )
+    return counters
+
+
+def read_nettop_counters(*, nettop_path: str = "nettop") -> dict[str, ProcessCounter]:
+    command = [
+        nettop_path,
+        "-P",
+        "-x",
+        "-L",
+        "1",
+        "-s",
+        "1",
+        "-n",
+        "-J",
+        "bytes_in,bytes_out",
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or f"nettop exited with {completed.returncode}"
+        raise RuntimeError(message)
+    return parse_nettop_counter_csv(completed.stdout)
+
+
+def diff_nettop_counters(
+    previous: dict[str, ProcessCounter],
+    current: dict[str, ProcessCounter],
+    *,
+    include_new_processes: bool = True,
+) -> list[ProcessDelta]:
+    rows: list[ProcessDelta] = []
+    for raw_process, current_counter in current.items():
+        previous_counter = previous.get(raw_process)
+        if previous_counter is None:
+            if not include_new_processes:
+                continue
+            bytes_in = max(0, current_counter.bytes_in)
+            bytes_out = max(0, current_counter.bytes_out)
+        else:
+            # nettop counters can reset when a socket/process disappears and is
+            # recreated. Clamp each direction independently so a reset never
+            # creates negative traffic in the database.
+            bytes_in = max(0, current_counter.bytes_in - previous_counter.bytes_in)
+            bytes_out = max(0, current_counter.bytes_out - previous_counter.bytes_out)
+        if bytes_in + bytes_out <= 0:
+            continue
+        rows.append(
+            ProcessDelta(
+                raw_process=current_counter.raw_process,
+                process=current_counter.process,
+                pid=current_counter.pid,
+                bytes_in=bytes_in,
+                bytes_out=bytes_out,
+            )
+        )
+    return rows
+
+
+def aggregate_process_deltas(rows: Iterable[ProcessDelta]) -> list[ProcessDelta]:
+    totals: dict[str, ProcessDelta] = {}
+    for row in rows:
+        existing = totals.get(row.raw_process)
+        if existing is None:
+            totals[row.raw_process] = row
+            continue
+        totals[row.raw_process] = ProcessDelta(
+            raw_process=row.raw_process,
+            process=row.process,
+            pid=row.pid,
+            bytes_in=existing.bytes_in + row.bytes_in,
+            bytes_out=existing.bytes_out + row.bytes_out,
+        )
+    return sorted(totals.values(), key=lambda row: row.total_bytes, reverse=True)
+
+
+def collect_once_delta(interval_seconds: int, *, nettop_path: str = "nettop") -> list[ProcessDelta]:
     if interval_seconds < 1:
         raise ValueError("interval_seconds must be >= 1")
     command = [
@@ -236,6 +369,57 @@ def collect_once(interval_seconds: int, *, nettop_path: str = "nettop") -> list[
         message = completed.stderr.strip() or completed.stdout.strip() or f"nettop exited with {completed.returncode}"
         raise RuntimeError(message)
     return parse_nettop_csv(completed.stdout, skip_first_sample=True)
+
+
+def collect_once_snapshot(
+    interval_seconds: int,
+    *,
+    nettop_path: str = "nettop",
+    poll_interval_seconds: float = DEFAULT_SNAPSHOT_POLL_INTERVAL_SECONDS,
+    stop_event: threading.Event | None = None,
+) -> list[ProcessDelta]:
+    if interval_seconds < 1:
+        raise ValueError("interval_seconds must be >= 1")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be > 0")
+
+    previous = read_nettop_counters(nettop_path=nettop_path)
+    deadline = time.monotonic() + interval_seconds
+    collected: list[ProcessDelta] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait_seconds = min(float(poll_interval_seconds), remaining)
+        if stop_event is not None:
+            if stop_event.wait(wait_seconds):
+                break
+        else:
+            time.sleep(wait_seconds)
+        current = read_nettop_counters(nettop_path=nettop_path)
+        collected.extend(diff_nettop_counters(previous, current, include_new_processes=True))
+        previous = current
+    return aggregate_process_deltas(collected)
+
+
+def collect_once(
+    interval_seconds: int,
+    *,
+    nettop_path: str = "nettop",
+    collector_mode: str = DEFAULT_COLLECTOR_MODE,
+    snapshot_poll_interval_seconds: float = DEFAULT_SNAPSHOT_POLL_INTERVAL_SECONDS,
+    stop_event: threading.Event | None = None,
+) -> list[ProcessDelta]:
+    if collector_mode == "delta":
+        return collect_once_delta(interval_seconds, nettop_path=nettop_path)
+    if collector_mode == "snapshot":
+        return collect_once_snapshot(
+            interval_seconds,
+            nettop_path=nettop_path,
+            poll_interval_seconds=snapshot_poll_interval_seconds,
+            stop_event=stop_event,
+        )
+    raise ValueError(f"unsupported collector mode: {collector_mode}")
 
 
 def ensure_data_dirs(data_dir: Path) -> None:
@@ -2101,13 +2285,23 @@ def collector_loop(
     *,
     interval_seconds: int,
     nettop_path: str,
+    collector_mode: str,
+    snapshot_poll_interval_seconds: float,
     stop_event: threading.Event,
     sync_config: SyncConfig | None,
     sync_backoff: SyncBackoff,
 ) -> None:
     while not stop_event.is_set():
         try:
-            rows = collect_once(interval_seconds, nettop_path=nettop_path)
+            rows = collect_once(
+                interval_seconds,
+                nettop_path=nettop_path,
+                collector_mode=collector_mode,
+                snapshot_poll_interval_seconds=snapshot_poll_interval_seconds,
+                stop_event=stop_event,
+            )
+            if stop_event.is_set():
+                break
             stamp = local_now()
             append_sample_record(data_dir, rows, interval_seconds=interval_seconds, timestamp=stamp)
             state.record_sample(stamp, rows)
@@ -2126,6 +2320,8 @@ def serve(
     *,
     interval_seconds: int,
     nettop_path: str,
+    collector_mode: str,
+    snapshot_poll_interval_seconds: float,
     collect: bool,
     sync_config: SyncConfig | None = None,
 ) -> None:
@@ -2144,6 +2340,8 @@ def serve(
                 "state": state,
                 "interval_seconds": interval_seconds,
                 "nettop_path": nettop_path,
+                "collector_mode": collector_mode,
+                "snapshot_poll_interval_seconds": snapshot_poll_interval_seconds,
                 "stop_event": stop_event,
                 "sync_config": sync_config,
                 "sync_backoff": sync_backoff,
@@ -2159,6 +2357,7 @@ def serve(
     print(f"Data dir:  {data_dir}", flush=True)
     print(f"Database:  {database_path(data_dir)}", flush=True)
     print(f"Collect:   {'on' if collect else 'off'} interval={interval_seconds}s", flush=True)
+    print(f"Mode:      {collector_mode} poll={snapshot_poll_interval_seconds:g}s", flush=True)
     print(f"Sync:      {'on' if sync_config and sync_config.enabled else 'off'}", flush=True)
     try:
         server.serve_forever()
@@ -2204,6 +2403,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="collector interval seconds")
     parser.add_argument("--data-dir", type=Path, default=default_data_dir(), help="directory for the SQLite database")
     parser.add_argument("--nettop", default="nettop", help="path to nettop")
+    parser.add_argument(
+        "--collector-mode",
+        choices=("snapshot", "delta"),
+        default=DEFAULT_COLLECTOR_MODE,
+        help="snapshot polls instant cumulative nettop counters with low CPU; delta uses continuous nettop -d for maximum fidelity",
+    )
+    parser.add_argument(
+        "--snapshot-poll-interval",
+        type=float,
+        default=DEFAULT_SNAPSHOT_POLL_INTERVAL_SECONDS,
+        help=f"seconds between instant nettop snapshots in snapshot mode; default {DEFAULT_SNAPSHOT_POLL_INTERVAL_SECONDS:g}",
+    )
     parser.add_argument("--no-collect", action="store_true", help="serve dashboard without starting the collector")
     parser.add_argument("--init-db", action="store_true", help="initialize the SQLite database and exit")
     parser.add_argument("--collect-once", action="store_true", help="take one nettop sample and append it to the database")
@@ -2223,6 +2434,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.interval < 1:
         parser.error("--interval must be >= 1")
+    if args.snapshot_poll_interval <= 0:
+        parser.error("--snapshot-poll-interval must be > 0")
     if args.sync_completed_days and not sync_config.enabled:
         parser.error("--sync-completed-days requires --sync-db-url or NETWORK_TRAFFIC_SYNC_DATABASE_URL")
 
@@ -2240,7 +2453,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.collect_once:
-        rows = collect_once(args.interval, nettop_path=args.nettop)
+        rows = collect_once(
+            args.interval,
+            nettop_path=args.nettop,
+            collector_mode=args.collector_mode,
+            snapshot_poll_interval_seconds=args.snapshot_poll_interval,
+        )
         path = append_sample_record(args.data_dir, rows, interval_seconds=args.interval)
         if sync_config.enabled:
             sync_completed_days(args.data_dir, sync_config)
@@ -2268,6 +2486,8 @@ def main(argv: list[str] | None = None) -> int:
             args.data_dir,
             interval_seconds=args.interval,
             nettop_path=args.nettop,
+            collector_mode=args.collector_mode,
+            snapshot_poll_interval_seconds=args.snapshot_poll_interval,
             collect=not args.no_collect,
             sync_config=sync_config,
         )

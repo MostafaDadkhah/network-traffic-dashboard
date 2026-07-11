@@ -140,3 +140,9 @@ Reason: Invalid dates should not look like empty valid days, and CSV output shou
 Decision: Failed PostgreSQL archive sync attempts are non-fatal and use a 15-minute retry backoff by default. Remote read helpers no longer run schema DDL; only the write-side sync path ensures remote schema, and only when there is a completed local day with data to sync.
 
 Reason: VPN/proxy/DNS failures can make `psql` fail fast or hang. The collector must keep sampling locally without spawning `psql` on every interval or filling LaunchAgent logs, and GET/read paths should not perform remote DDL side effects.
+
+### 2026-07-11 - Low-CPU snapshot collector default
+
+Decision: Make the default collector mode `snapshot`: poll instant cumulative `nettop -P -x -L 1 -s 1 -n -J bytes_in,bytes_out` snapshots every 5 seconds, compute deltas in Python, aggregate them, and write one SQLite sample per configured interval. Keep the old continuous delta sampler available as `--collector-mode delta`.
+
+Reason: Continuous `nettop -d -L 2 -s <interval>` preserves maximum short-lived-process fidelity, but it can peg a full CPU core for the entire interval on busy Macs. Snapshot polling preserves the dashboard's app-attributed per-process goal for normal long-running traffic while reducing collector CPU to brief nettop invocations.

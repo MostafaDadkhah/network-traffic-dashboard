@@ -10,7 +10,7 @@ The collector samples Apple's `nettop`, stores every sample in SQLite, and serve
 
 ## Features
 
-- Per-process traffic attribution using `nettop -P -x -d -L 2 -s <interval> -n`.
+- Low-CPU per-process traffic attribution using instant `nettop -P -x -L 1` counter snapshots by default; legacy continuous `nettop -P -x -d -L 2 -s <interval> -n` delta mode remains available when maximum short-lived-process fidelity is worth the CPU cost.
 - SQLite database storage for every sample and every process delta.
 - Daily app-attributed totals chart across all recorded days.
 - Hourly app-attributed chart for the selected day.
@@ -30,6 +30,21 @@ The collector samples Apple's `nettop`, stores every sample in SQLite, and serve
 ```bash
 cd ~/Documents/NetworkTrafficDashboard
 python3 network_usage_dashboard.py --serve 127.0.0.1:18686 --interval 60
+```
+
+The default `snapshot` collector keeps CPU low by taking quick cumulative
+`nettop` snapshots every 5 seconds and computing deltas in Python, then writing
+one database sample per `--interval`. If you need the older continuous nettop
+delta sampler for maximum fidelity on very short-lived processes, use:
+
+```bash
+python3 network_usage_dashboard.py --serve 127.0.0.1:18686 --interval 60 --collector-mode delta
+```
+
+For lower or higher snapshot granularity:
+
+```bash
+python3 network_usage_dashboard.py --serve 127.0.0.1:18686 --interval 60 --snapshot-poll-interval 2
 ```
 
 Open:
@@ -139,6 +154,8 @@ Override examples:
 
 ```bash
 INTERVAL=30 BIND=127.0.0.1:18687 ./install_network_dashboard_launch_agent.sh
+COLLECTOR_MODE=delta ./install_network_dashboard_launch_agent.sh
+SNAPSHOT_POLL_INTERVAL=2 ./install_network_dashboard_launch_agent.sh
 ```
 
 Enable optional archive sync in the LaunchAgent:
