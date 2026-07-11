@@ -54,6 +54,7 @@ Rules:
 - Tag `MacPacketTunnel`, `Shadowrocket`, and similar tunnel processes as aggregate tunnel rows.
 - Do not rank tunnel aggregates as app usage. Main totals, charts, and tables should use app-attributed non-tunnel rows by default and expose tunnel aggregate volume separately.
 - Do not return unbounded PID lists from summary APIs. Return `pid_count` plus a small recent PID sample so respawning processes remain visible without bloating JSON or breaking the table.
+- Treat PostgreSQL archive sync as optional/non-fatal. Failed sync attempts must back off instead of retrying every collector interval, and GET/read helpers must not run remote schema DDL.
 - Keep dashboard access logging off by default; enable `NETWORK_TRAFFIC_ACCESS_LOG=1` only for request-level debugging.
 
 ## Verification commands

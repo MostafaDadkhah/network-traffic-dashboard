@@ -134,3 +134,9 @@ Reason: Long-running collectors accumulate thousands of PIDs for respawning proc
 Decision: HTTP date query parameters must use `YYYY-MM-DD` and invalid values return HTTP 400. CSV export remains app-attributed by default, with `include_tunnels=1` for separate tunnel aggregate rows.
 
 Reason: Invalid dates should not look like empty valid days, and CSV output should make the app-vs-tunnel distinction explicit instead of carrying an always-false tunnel flag in the default export.
+
+### 2026-07-11 - Sync failure backoff and read-only archive reads
+
+Decision: Failed PostgreSQL archive sync attempts are non-fatal and use a 15-minute retry backoff by default. Remote read helpers no longer run schema DDL; only the write-side sync path ensures remote schema, and only when there is a completed local day with data to sync.
+
+Reason: VPN/proxy/DNS failures can make `psql` fail fast or hang. The collector must keep sampling locally without spawning `psql` on every interval or filling LaunchAgent logs, and GET/read paths should not perform remote DDL side effects.

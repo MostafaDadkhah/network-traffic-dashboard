@@ -32,12 +32,14 @@ DEFAULT_API_PROCESS_LIMIT = 40
 MAX_API_PROCESS_LIMIT = 200
 DEFAULT_PID_SAMPLE_LIMIT = 8
 MAX_PID_SAMPLE_LIMIT = 50
+DEFAULT_SYNC_RETRY_INTERVAL_SECONDS = 900
 SCHEMA_VERSION = 2
 DATABASE_FILENAME = "network_traffic.sqlite3"
 SYNC_DATABASE_URL_ENV = "NETWORK_TRAFFIC_SYNC_DATABASE_URL"
 SYNC_PSQL_ENV = "NETWORK_TRAFFIC_SYNC_PSQL"
 SYNC_KEYCHAIN_SERVICE_ENV = "NETWORK_TRAFFIC_SYNC_KEYCHAIN_SERVICE"
 SYNC_KEYCHAIN_ACCOUNT_ENV = "NETWORK_TRAFFIC_SYNC_KEYCHAIN_ACCOUNT"
+SYNC_RETRY_INTERVAL_ENV = "NETWORK_TRAFFIC_SYNC_RETRY_INTERVAL_SECONDS"
 
 
 def default_data_dir() -> Path:
@@ -74,10 +76,27 @@ class SyncConfig:
     prune_after_sync: bool = True
     keep_local_days: int = 0
     connect_timeout: int = 15
+    retry_interval_seconds: int = DEFAULT_SYNC_RETRY_INTERVAL_SECONDS
 
     @property
     def enabled(self) -> bool:
         return bool(self.database_url)
+
+
+class SyncBackoff:
+    def __init__(self, retry_interval_seconds: int) -> None:
+        self.retry_interval_seconds = max(0, int(retry_interval_seconds))
+        self.next_attempt_at: datetime | None = None
+
+    def should_attempt(self, now: datetime) -> bool:
+        return self.next_attempt_at is None or now >= self.next_attempt_at
+
+    def record_success(self) -> None:
+        self.next_attempt_at = None
+
+    def record_failure(self, now: datetime) -> datetime:
+        self.next_attempt_at = now + timedelta(seconds=self.retry_interval_seconds)
+        return self.next_attempt_at
 
 
 class CollectorState:
@@ -88,6 +107,7 @@ class CollectorState:
         self.last_sync_at: str | None = None
         self.last_sync_error: str | None = None
         self.last_sync_days: list[str] = []
+        self.next_sync_attempt_at: str | None = None
         self.last_process_count = 0
         self.last_total_bytes = 0
         self.samples_written = 0
@@ -104,11 +124,12 @@ class CollectorState:
         with self._lock:
             self.last_error = error
 
-    def record_sync(self, days: list[str], error: str | None = None) -> None:
+    def record_sync(self, days: list[str], error: str | None = None, next_attempt_at: str | None = None) -> None:
         with self._lock:
             self.last_sync_at = local_now().isoformat(timespec="seconds")
             self.last_sync_error = error
             self.last_sync_days = days
+            self.next_sync_attempt_at = next_attempt_at
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -118,6 +139,7 @@ class CollectorState:
                 "last_sync_at": self.last_sync_at,
                 "last_sync_error": self.last_sync_error,
                 "last_sync_days": self.last_sync_days,
+                "next_sync_attempt_at": self.next_sync_attempt_at,
                 "last_process_count": self.last_process_count,
                 "last_total_bytes": self.last_total_bytes,
                 "samples_written": self.samples_written,
@@ -317,14 +339,23 @@ def run_psql(
     if not sync_config.enabled:
         raise ValueError("sync database is not configured")
     command = [sync_config.psql_path, "-X", *args]
-    return subprocess.run(
-        command,
-        input=input_text,
-        capture_output=capture,
-        text=True,
-        env=postgres_env(sync_config),
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            command,
+            input=input_text,
+            capture_output=capture,
+            text=True,
+            env=postgres_env(sync_config),
+            check=False,
+            timeout=max(1, sync_config.connect_timeout + 5),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=exc.stdout if isinstance(exc.stdout, str) else "",
+            stderr=f"psql timed out after {max(1, sync_config.connect_timeout + 5)} seconds",
+        )
 
 
 def run_psql_checked(sync_config: SyncConfig, args: Sequence[str], *, input_text: str | None = None) -> str:
@@ -688,12 +719,18 @@ def delete_local_day(data_dir: Path, date: str, *, vacuum: bool = True) -> None:
 def sync_completed_days(data_dir: Path, sync_config: SyncConfig, *, today: str | None = None) -> list[str]:
     if not sync_config.enabled:
         return []
-    synced: list[str] = []
-    ensure_remote_schema(sync_config)
+    candidates: list[tuple[str, dict[str, int]]] = []
     for date in completed_local_days(data_dir, sync_config, today=today):
         local_counts = local_day_counts(data_dir, date)
         if sum(local_counts.values()) == 0:
             continue
+        candidates.append((date, local_counts))
+    if not candidates:
+        return []
+
+    synced: list[str] = []
+    ensure_remote_schema(sync_config)
+    for date, local_counts in candidates:
         run_psql_script(sync_config, sync_sql_for_day(data_dir, date))
         remote_counts = remote_day_counts(sync_config, date)
         missing = [
@@ -1029,7 +1066,6 @@ def summarize_day_remote(
     pid_limit = min(max(int(pid_limit), 0), MAX_PID_SAMPLE_LIMIT)
     if top_limit is not None:
         top_limit = min(max(int(top_limit), 1), MAX_API_PROCESS_LIMIT)
-    ensure_remote_schema(sync_config)
     selected_date = sql_literal(date)
     sample_stats = psql_json_one(
         sync_config,
@@ -1225,7 +1261,6 @@ def list_days_local(data_dir: Path) -> list[dict[str, Any]]:
 
 
 def list_days_remote(sync_config: SyncConfig) -> list[dict[str, Any]]:
-    ensure_remote_schema(sync_config)
     rows = psql_json_rows(
         sync_config,
         """
@@ -1343,7 +1378,6 @@ def timeseries_day(data_dir: Path, date: str | None = None, *, sync_config: Sync
 
 
 def timeseries_day_remote(sync_config: SyncConfig, date: str) -> list[dict[str, Any]]:
-    ensure_remote_schema(sync_config)
     selected_date = sql_literal(date)
     rows = psql_json_rows(
         sync_config,
@@ -1777,8 +1811,9 @@ async function loadSummary() {
   if (!rows.length) tbody.innerHTML = '<tr><td colspan="6">No data has been recorded yet.</td></tr>';
   const err = data.last_error ? ` <span class="error">Last error: ${escapeHtml(data.last_error)}</span>` : '';
   const syncErr = collectorState.last_sync_error ? ` <span class="error">Sync error: ${escapeHtml(collectorState.last_sync_error)}</span>` : '';
+  const syncRetry = collectorState.next_sync_attempt_at ? ` Next sync retry: ${escapeHtml(collectorState.next_sync_attempt_at)}.` : '';
   const syncLabel = syncState.enabled ? ' Sync: enabled.' : '';
-  document.getElementById('footer').innerHTML = `Database: ${escapeHtml(data.database_path)}. App totals exclude tunnel transport aggregate (${fmtBytes(data.tunnel_total_bytes)}). Observed raw total including tunnel: ${fmtBytes(data.observed_total_bytes)}.${syncLabel}${err}${syncErr}`;
+  document.getElementById('footer').innerHTML = `Database: ${escapeHtml(data.database_path)}. App totals exclude tunnel transport aggregate (${fmtBytes(data.tunnel_total_bytes)}). Observed raw total including tunnel: ${fmtBytes(data.observed_total_bytes)}.${syncLabel}${syncRetry}${err}${syncErr}`;
 }
 async function refreshAll() { await loadDays(); await loadSummary(); }
 document.getElementById('refreshBtn').addEventListener('click', refreshAll);
@@ -1980,6 +2015,7 @@ def sync_status(sync_config: SyncConfig | None) -> dict[str, Any]:
         "psql_path": sync_config.psql_path,
         "prune_after_sync": sync_config.prune_after_sync,
         "keep_local_days": sync_config.keep_local_days,
+        "retry_interval_seconds": sync_config.retry_interval_seconds,
         "keychain_account": sync_config.keychain_account,
         "keychain_service": sync_config.keychain_service,
     }
@@ -2035,6 +2071,30 @@ def parse_bind(bind: str) -> tuple[str, int]:
     return host, int(port_text)
 
 
+def attempt_sync_with_backoff(
+    data_dir: Path,
+    sync_config: SyncConfig | None,
+    state: CollectorState,
+    backoff: SyncBackoff,
+    *,
+    force: bool = False,
+) -> list[str]:
+    if not sync_config or not sync_config.enabled:
+        return []
+    now = local_now()
+    if not force and not backoff.should_attempt(now):
+        return []
+    try:
+        synced_days = sync_completed_days(data_dir, sync_config)
+    except Exception as exc:  # noqa: BLE001 - optional archive should not stop collection
+        next_attempt = backoff.record_failure(now)
+        state.record_sync([], str(exc), next_attempt.isoformat(timespec="seconds"))
+        return []
+    backoff.record_success()
+    state.record_sync(synced_days)
+    return synced_days
+
+
 def collector_loop(
     data_dir: Path,
     state: CollectorState,
@@ -2043,6 +2103,7 @@ def collector_loop(
     nettop_path: str,
     stop_event: threading.Event,
     sync_config: SyncConfig | None,
+    sync_backoff: SyncBackoff,
 ) -> None:
     while not stop_event.is_set():
         try:
@@ -2051,12 +2112,7 @@ def collector_loop(
             append_sample_record(data_dir, rows, interval_seconds=interval_seconds, timestamp=stamp)
             state.record_sample(stamp, rows)
             if sync_config and sync_config.enabled:
-                try:
-                    synced_days = sync_completed_days(data_dir, sync_config)
-                    if synced_days:
-                        state.record_sync(synced_days)
-                except Exception as sync_exc:  # noqa: BLE001 - optional archive should not stop collection
-                    state.record_sync([], str(sync_exc))
+                attempt_sync_with_backoff(data_dir, sync_config, state, sync_backoff)
         except Exception as exc:  # noqa: BLE001 - this is a resilient background collector
             message = str(exc)
             append_error_record(data_dir, message)
@@ -2075,12 +2131,9 @@ def serve(
 ) -> None:
     init_database(data_dir)
     state = CollectorState()
+    sync_backoff = SyncBackoff(sync_config.retry_interval_seconds if sync_config else DEFAULT_SYNC_RETRY_INTERVAL_SECONDS)
     if sync_config and sync_config.enabled:
-        try:
-            synced_days = sync_completed_days(data_dir, sync_config)
-            state.record_sync(synced_days)
-        except Exception as exc:  # noqa: BLE001 - the dashboard can still serve local data
-            state.record_sync([], str(exc))
+        attempt_sync_with_backoff(data_dir, sync_config, state, sync_backoff, force=True)
     stop_event = threading.Event()
     collector: threading.Thread | None = None
     if collect:
@@ -2093,6 +2146,7 @@ def serve(
                 "nettop_path": nettop_path,
                 "stop_event": stop_event,
                 "sync_config": sync_config,
+                "sync_backoff": sync_backoff,
             },
             daemon=True,
         )
@@ -2130,6 +2184,9 @@ def build_sync_config(args: argparse.Namespace) -> SyncConfig:
     keep_local_days = args.sync_keep_local_days
     if keep_local_days is None:
         keep_local_days = int(os.environ.get("NETWORK_TRAFFIC_SYNC_KEEP_LOCAL_DAYS", "0") or 0)
+    retry_interval_seconds = args.sync_retry_interval_seconds
+    if retry_interval_seconds is None:
+        retry_interval_seconds = int(os.environ.get(SYNC_RETRY_INTERVAL_ENV, str(DEFAULT_SYNC_RETRY_INTERVAL_SECONDS)) or DEFAULT_SYNC_RETRY_INTERVAL_SECONDS)
     return SyncConfig(
         database_url=database_url,
         psql_path=psql_path,
@@ -2137,6 +2194,7 @@ def build_sync_config(args: argparse.Namespace) -> SyncConfig:
         keychain_account=keychain_account,
         prune_after_sync=prune_after_sync,
         keep_local_days=max(0, int(keep_local_days)),
+        retry_interval_seconds=max(0, int(retry_interval_seconds)),
     )
 
 
@@ -2157,6 +2215,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sync-keychain-service", help=f"macOS Keychain service for archive DB password; also reads ${SYNC_KEYCHAIN_SERVICE_ENV}")
     parser.add_argument("--sync-keychain-account", help=f"macOS Keychain account for archive DB password; also reads ${SYNC_KEYCHAIN_ACCOUNT_ENV}")
     parser.add_argument("--sync-keep-local-days", type=int, help="completed local days to keep after sync; default 0")
+    parser.add_argument("--sync-retry-interval-seconds", type=int, help=f"seconds to wait after a failed archive sync before retrying; default {DEFAULT_SYNC_RETRY_INTERVAL_SECONDS}; also reads ${SYNC_RETRY_INTERVAL_ENV}")
     parser.add_argument("--no-sync-prune", action="store_true", help="sync completed days but keep them in the local SQLite database")
     parser.add_argument("--sync-completed-days", action="store_true", help="sync and prune completed local days, then exit")
     args = parser.parse_args(argv)

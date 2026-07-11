@@ -104,6 +104,11 @@ python3 network_usage_dashboard.py --serve 127.0.0.1:18686 --interval 60
 Prefer a passwordless PostgreSQL URL plus macOS Keychain variables. Do not put a
 database password in LaunchAgent arguments or committed documentation.
 
+Failed archive sync attempts are non-fatal and back off for 15 minutes by
+default so collector sampling continues without spawning `psql` every interval.
+Override with `NETWORK_TRAFFIC_SYNC_RETRY_INTERVAL_SECONDS` or
+`--sync-retry-interval-seconds` when debugging.
+
 Sync completed local days once and exit:
 
 ```bash

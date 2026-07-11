@@ -8,7 +8,7 @@ import io
 import threading
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import network_usage_dashboard as dashboard
 
@@ -202,6 +202,57 @@ def test_completed_local_days_respects_today_and_keep_window(tmp_path) -> None:
     assert dashboard.completed_local_days(tmp_path, keep_yesterday, today="2026-07-04") == []
 
 
+def test_sync_completed_days_does_not_connect_when_no_completed_day(tmp_path, monkeypatch) -> None:
+    rows = [dashboard.ProcessDelta("node.123", "node", 123, 100, 50)]
+    dashboard.append_sample_record(
+        tmp_path,
+        rows,
+        interval_seconds=1,
+        timestamp=datetime(2026, 7, 4, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    sync_config = dashboard.SyncConfig(database_url="postgresql://user@example.test/archive")
+
+    def fail_if_called(_sync_config: dashboard.SyncConfig) -> None:
+        raise AssertionError("remote schema should not be touched when there are no completed local days")
+
+    monkeypatch.setattr(dashboard, "ensure_remote_schema", fail_if_called)
+
+    assert dashboard.sync_completed_days(tmp_path, sync_config, today="2026-07-04") == []
+
+
+def test_sync_backoff_suppresses_retries_until_retry_window(tmp_path, monkeypatch) -> None:
+    now = datetime(2026, 7, 4, 12, 0, 0, tzinfo=timezone.utc)
+    current = [now]
+    calls = {"count": 0}
+
+    def fake_now() -> datetime:
+        return current[0]
+
+    def fake_sync(_data_dir: object, _sync_config: dashboard.SyncConfig) -> list[str]:
+        calls["count"] += 1
+        raise RuntimeError("temporary sync failure")
+
+    monkeypatch.setattr(dashboard, "local_now", fake_now)
+    monkeypatch.setattr(dashboard, "sync_completed_days", fake_sync)
+
+    state = dashboard.CollectorState()
+    backoff = dashboard.SyncBackoff(60)
+    sync_config = dashboard.SyncConfig(database_url="postgresql://user@example.test/archive", retry_interval_seconds=60)
+
+    assert dashboard.attempt_sync_with_backoff(tmp_path, sync_config, state, backoff) == []
+    assert calls["count"] == 1
+    assert state.snapshot()["last_sync_error"] == "temporary sync failure"
+    assert state.snapshot()["next_sync_attempt_at"] == (now + timedelta(seconds=60)).isoformat(timespec="seconds")
+
+    current[0] = now + timedelta(seconds=30)
+    assert dashboard.attempt_sync_with_backoff(tmp_path, sync_config, state, backoff) == []
+    assert calls["count"] == 1
+
+    current[0] = now + timedelta(seconds=61)
+    assert dashboard.attempt_sync_with_backoff(tmp_path, sync_config, state, backoff) == []
+    assert calls["count"] == 2
+
+
 def test_delete_local_day_only_removes_selected_day(tmp_path) -> None:
     rows = [dashboard.ProcessDelta("node.123", "node", 123, 100, 50)]
     dashboard.append_sample_record(
@@ -255,6 +306,7 @@ def test_dashboard_html_is_english() -> None:
     assert "chartTooltip" in dashboard.DASHBOARD_HTML
     assert "DASHBOARD_TOP_LIMIT" in dashboard.DASHBOARD_HTML
     assert "PID_SAMPLE_LIMIT" in dashboard.DASHBOARD_HTML
+    assert "next_sync_attempt_at" in dashboard.DASHBOARD_HTML
     assert "formatPids" in dashboard.DASHBOARD_HTML
     assert "PID sample" in dashboard.DASHBOARD_HTML
     assert "tooltipHtml" in dashboard.DASHBOARD_HTML
