@@ -758,6 +758,20 @@ def local_day_counts(data_dir: Path, date: str) -> dict[str, int]:
     return {"samples": samples, "process_deltas": process_deltas, "errors": errors}
 
 
+def local_day_has_data(data_dir: Path, date: str) -> bool:
+    """Return whether a day still has local rows waiting to be archived."""
+    init_database(data_dir)
+    with connect_database(data_dir) as conn:
+        row = conn.execute(
+            """
+            SELECT EXISTS(SELECT 1 FROM samples WHERE date = ?)
+                OR EXISTS(SELECT 1 FROM errors WHERE date = ?)
+            """,
+            (date, date),
+        ).fetchone()
+    return bool(row and row[0])
+
+
 def remote_day_counts(sync_config: SyncConfig, date: str) -> dict[str, int]:
     quoted_date = sql_literal(date)
     row = psql_json_one(
@@ -1066,8 +1080,12 @@ def normalize_latest_process_rows(rows: Iterable[Any]) -> list[dict[str, Any]]:
     return normalized
 
 
-def should_read_remote(sync_config: SyncConfig | None, date: str) -> bool:
-    return bool(sync_config and sync_config.enabled and date < day_string())
+def should_read_remote(sync_config: SyncConfig | None, date: str, *, data_dir: Path | None = None) -> bool:
+    if not sync_config or not sync_config.enabled or date >= day_string():
+        return False
+    # A completed day is pruned only after remote row-count verification. If a
+    # sync attempt failed, its rows remain local and are the authoritative copy.
+    return data_dir is None or not local_day_has_data(data_dir, date)
 
 
 def summarize_day(
@@ -1082,7 +1100,7 @@ def summarize_day(
     pid_limit = min(max(int(pid_limit), 0), MAX_PID_SAMPLE_LIMIT)
     if top_limit is not None:
         top_limit = min(max(int(top_limit), 1), MAX_API_PROCESS_LIMIT)
-    if should_read_remote(sync_config, selected_date):
+    if should_read_remote(sync_config, selected_date, data_dir=data_dir):
         try:
             assert sync_config is not None
             return summarize_day_remote(sync_config, data_dir, selected_date, top_limit=top_limit, pid_limit=pid_limit)
@@ -1513,17 +1531,19 @@ def list_days(data_dir: Path, *, sync_config: SyncConfig | None = None) -> list[
         return local_days
     today = day_string()
     merged: dict[str, dict[str, Any]] = {}
-    for day in local_days:
-        merged[day["date"]] = day
     for day in remote_days:
         if str(day["date"]) < today:
             merged[str(day["date"])] = day
+    # Unsynced or not-yet-pruned local days must win over an incomplete remote
+    # copy so the dashboard never hides the only complete copy of a day.
+    for day in local_days:
+        merged[day["date"]] = day
     return sorted(merged.values(), key=lambda item: item["date"], reverse=True)
 
 
 def timeseries_day(data_dir: Path, date: str | None = None, *, sync_config: SyncConfig | None = None) -> list[dict[str, Any]]:
     selected_date = date or day_string()
-    if should_read_remote(sync_config, selected_date):
+    if should_read_remote(sync_config, selected_date, data_dir=data_dir):
         try:
             return timeseries_day_remote(sync_config, selected_date)
         except Exception:
@@ -2279,6 +2299,25 @@ def attempt_sync_with_backoff(
     return synced_days
 
 
+def record_collector_error(data_dir: Path, state: CollectorState, error: Exception) -> None:
+    """Record a collector failure without letting error persistence kill it."""
+    message = str(error)
+    state.record_error(message)
+    try:
+        append_error_record(data_dir, message)
+    except Exception as persistence_error:  # noqa: BLE001 - disk-full recovery must stay alive
+        stamp = local_now().isoformat(timespec="seconds")
+        try:
+            print(
+                f"[{stamp}] Collector error: {message}; failed to persist collector error: {persistence_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except OSError:
+            # stderr is a LaunchAgent log on the same volume and can fail too.
+            pass
+
+
 def collector_loop(
     data_dir: Path,
     state: CollectorState,
@@ -2308,9 +2347,7 @@ def collector_loop(
             if sync_config and sync_config.enabled:
                 attempt_sync_with_backoff(data_dir, sync_config, state, sync_backoff)
         except Exception as exc:  # noqa: BLE001 - this is a resilient background collector
-            message = str(exc)
-            append_error_record(data_dir, message)
-            state.record_error(message)
+            record_collector_error(data_dir, state, exc)
             stop_event.wait(min(interval_seconds, 30))
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sqlite3
 import threading
 import urllib.error
 import urllib.request
@@ -318,6 +319,105 @@ def test_sync_backoff_suppresses_retries_until_retry_window(tmp_path, monkeypatc
     current[0] = now + timedelta(seconds=61)
     assert dashboard.attempt_sync_with_backoff(tmp_path, sync_config, state, backoff) == []
     assert calls["count"] == 2
+
+
+def test_unsynced_completed_day_stays_local_for_dashboard_reads(tmp_path, monkeypatch) -> None:
+    rows = [dashboard.ProcessDelta("node.123", "node", 123, 100, 50)]
+    dashboard.append_sample_record(
+        tmp_path,
+        rows,
+        interval_seconds=1,
+        timestamp=datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    sync_config = dashboard.SyncConfig(database_url="postgresql://user@example.test/archive")
+
+    def unexpected_remote_read(*_args, **_kwargs):
+        raise AssertionError("a completed day still present locally must not be read remotely")
+
+    monkeypatch.setattr(dashboard, "summarize_day_remote", unexpected_remote_read)
+    monkeypatch.setattr(dashboard, "timeseries_day_remote", unexpected_remote_read)
+    monkeypatch.setattr(
+        dashboard,
+        "list_days_remote",
+        lambda _config: [
+            {
+                "date": "2026-07-03",
+                "storage": "remote",
+                "sample_count": 0,
+                "error_count": 0,
+                "total_bytes": 0,
+                "bytes_in": 0,
+                "bytes_out": 0,
+                "tunnel_bytes_in": 0,
+                "tunnel_bytes_out": 0,
+                "tunnel_total_bytes": 0,
+                "observed_total_bytes": 0,
+                "last_sample_at": None,
+                "database_path": "remote",
+            }
+        ],
+    )
+
+    summary = dashboard.summarize_day(tmp_path, "2026-07-03", sync_config=sync_config)
+    series = dashboard.timeseries_day(tmp_path, "2026-07-03", sync_config=sync_config)
+    days = dashboard.list_days(tmp_path, sync_config=sync_config)
+
+    assert summary["storage"] == "local"
+    assert summary["sample_count"] == 1
+    assert series[0]["sample_count"] == 1
+    assert days[0]["storage"] == "local"
+    assert days[0]["sample_count"] == 1
+
+
+def test_collector_retries_after_disk_full_prevents_error_logging(tmp_path, monkeypatch) -> None:
+    class FullDiskStream(io.StringIO):
+        def write(self, _text: str) -> int:
+            raise OSError("no space left on device")
+
+    class StopEvent:
+        stopped = False
+
+        def is_set(self) -> bool:
+            return self.stopped
+
+        def wait(self, _seconds: float) -> bool:
+            return self.stopped
+
+    stop_event = StopEvent()
+    append_calls = {"count": 0}
+
+    monkeypatch.setattr(dashboard, "collect_once", lambda *_args, **_kwargs: [])
+
+    def append_sample(*_args, **_kwargs):
+        append_calls["count"] += 1
+        if append_calls["count"] == 1:
+            raise sqlite3.OperationalError("database or disk is full")
+        stop_event.stopped = True
+        return tmp_path / dashboard.DATABASE_FILENAME
+
+    def append_error(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(dashboard, "append_sample_record", append_sample)
+    monkeypatch.setattr(dashboard, "append_error_record", append_error)
+    state = dashboard.CollectorState()
+
+    with contextlib.redirect_stderr(FullDiskStream()):
+        dashboard.collector_loop(
+            tmp_path,
+            state,
+            interval_seconds=1,
+            nettop_path="nettop",
+            collector_mode="snapshot",
+            snapshot_poll_interval_seconds=1,
+            stop_event=stop_event,
+            sync_config=None,
+            sync_backoff=dashboard.SyncBackoff(60),
+        )
+
+    assert append_calls["count"] == 2
+    assert state.snapshot()["samples_written"] == 1
+    assert state.snapshot()["last_error"] is None
 
 
 def test_delete_local_day_only_removes_selected_day(tmp_path) -> None:

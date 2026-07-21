@@ -22,6 +22,8 @@ The collector samples Apple's `nettop`, stores every sample in SQLite, and serve
 - Separate tunnel aggregate card for `MacPacketTunnel` / `Shadowrocket` transport volume.
 - CSV export for each day.
 - Optional PostgreSQL archive sync: keep today in local SQLite, read completed days from the archive, and prune synced completed days from local storage.
+- Failed archive days remain locally authoritative until a verified retry succeeds, so historical dashboard/API reads never hide pending local data.
+- Collector write failures such as a temporarily full disk are reported and retried without terminating the background collector thread.
 - macOS LaunchAgent installer for automatic background collection.
 - No runtime Python packages beyond the standard library.
 
@@ -123,6 +125,10 @@ Failed archive sync attempts are non-fatal and back off for 15 minutes by
 default so collector sampling continues without spawning `psql` every interval.
 Override with `NETWORK_TRAFFIC_SYNC_RETRY_INTERVAL_SECONDS` or
 `--sync-retry-interval-seconds` when debugging.
+
+Completed days are deleted locally only after remote row-count verification. If
+the archive is temporarily unavailable, historical reads continue using the
+pending local copy until a later sync succeeds and prunes it.
 
 Sync completed local days once and exit:
 

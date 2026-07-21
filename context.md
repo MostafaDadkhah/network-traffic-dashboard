@@ -146,3 +146,9 @@ Reason: VPN/proxy/DNS failures can make `psql` fail fast or hang. The collector 
 Decision: Make the default collector mode `snapshot`: poll instant cumulative `nettop -P -x -L 1 -s 1 -n -J bytes_in,bytes_out` snapshots every 5 seconds, compute deltas in Python, aggregate them, and write one SQLite sample per configured interval. Keep the old continuous delta sampler available as `--collector-mode delta`.
 
 Reason: Continuous `nettop -d -L 2 -s <interval>` preserves maximum short-lived-process fidelity, but it can peg a full CPU core for the entire interval on busy Macs. Snapshot polling preserves the dashboard's app-attributed per-process goal for normal long-running traffic while reducing collector CPU to brief nettop invocations.
+
+### 2026-07-21 - Disk-full recovery and pending-day read authority
+
+Decision: A failure to persist a collector error must never escape the collector exception handler. Keep the in-memory error visible, write a fallback stderr message, and retry collection after the normal bounded delay. For historical reads, prefer any day that still exists locally over the PostgreSQL archive; switch to the archive only after verified sync pruning removes the local copy.
+
+Reason: A temporarily full macOS data volume caused both the sample write and its SQLite error-record write to fail, which terminated only the collector thread while leaving the HTTP process alive. The same incident left an unsynced completed day locally, while date-based archive routing could incorrectly return an empty remote result instead of that authoritative local copy.
